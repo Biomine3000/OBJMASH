@@ -42,6 +42,7 @@ while True:
     removables = set()
     for client_socket, client in clients.items():
         if client.disconnect:
+            logger.warn("Disconnecting {0}".format(client))
             removables.add(client_socket)
     for removable in removables:
         removable.close()
@@ -52,6 +53,8 @@ while True:
     exceptional_list = [socket]
 
     for client_socket, client in clients.items():
+        if client.metadata_received is False or client.payload_size is not None:
+            read_list.append(client_socket)
         if len(client.send_queue) or len(client.send_buffer) > 0:
             write_list.append(client_socket)
 
@@ -60,6 +63,7 @@ while True:
     for client_socket in rlist:
         if client_socket not in clients:
             client_socket, address = socket.accept()
+            client_socket.setblocking(False)
             clients[client_socket] = ClientState(address)
             logger.debug("Added new client {0}".format(clients[client_socket]))
         else:
@@ -67,8 +71,19 @@ while True:
         client = clients[client_socket]
 
         if client.metadata_received is False:
+            if len(client.leftover_buffer) > 0 and len(client.metadata_buffer) == 0:
+                client.metadata_buffer = client.leftover_buffer
+                if len(client.metadata_buffer) > 0 and client.metadata_buffer[0] == 0:
+                    client.metadata_buffer = client.metadata_buffer[1:]
+                client.leftover_buffer = bytes()
+
             bytes_left = METADATA_MAX_SIZE - len(client.metadata_buffer)
-            received = client_socket.recv(bytes_left)
+            try:
+                received = client_socket.recv(bytes_left)
+            except _socket.error as se:
+                client.disconnected = True
+                continue
+
             metadata_bytes_received = len(client.metadata_buffer) + len(received)
 
             nul_index = None
@@ -82,12 +97,13 @@ while True:
                 logger.error("Never encountered nul, closing socket {0}".format(client))
                 client.disconnect = True
             elif nul_index is None and metadata_bytes_received < METADATA_MAX_SIZE:
+                if len(received) == 0: # on rlist and nothing to read => error
+                    client.disconnect = True
+                    continue
                 logger.debug("Still some metadata left")
                 logger.debug(client.metadata_buffer)
-                read_list.append(client_socket)
             elif nul_index is None:
-                logger.error("Seems like we've read more than we should have, epic fail")
-                assert False
+                raise Exception("Seems like we've read more than we should have, epic fail")
             elif nul_index is not None:
                 client.metadata_buffer = client.metadata_buffer + received[0:nul_index]
                 client.leftover_buffer = received[nul_index:]
@@ -108,20 +124,29 @@ while True:
                     for client in clients.values():
                         client.send_queue.append((metadata, None))
                     client.metadata_received = False
+                    client.metadata_buffer = bytes()
         elif client.metadata_received is True and client.disconnect is False:
             if len(client.leftover_buffer) > 0:
                 client.payload_buffer = client.leftover_buffer
                 client.leftover_buffer = bytes()
 
             bytes_left = PAYLOAD_MAX_SIZE - len(client.payload_buffer)
-            received = client_socket.recv(bytes_left)
+            try:
+                received = client_socket.recv(bytes_left)
+            except _socket.error as se:
+                client.disconnected = True
+                continue
+
             payload_bytes_received = len(client.payload_buffer) + len(received)
 
             if payload_bytes_received < client.payload_size:
                 client.payload_buffer = client.payload_buffer + received
             elif payload_bytes_received == client.payload_size:
+                client.payload_size = None
                 for client in clients.values():
                     client.send_queue.append((metadata, client.payload_buffer))
+                client.metadata_buffer = bytes()
+                client.payload_buffer = bytes()
 
     for client_socket in wlist:
         client = clients[client_socket]
