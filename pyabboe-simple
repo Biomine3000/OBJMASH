@@ -36,7 +36,6 @@ def disconnect_client(client):
                   receive_buffer=client.receive_buffer,
                   disconnected=True)
 
-
 def remove_disconnected(clients, logger):
     disconnected = {client_socket:clients[client_socket]
                     for client_socket in clients
@@ -49,6 +48,44 @@ def remove_disconnected(clients, logger):
     return {client_socket:clients[client_socket]
             for client_socket in clients
             if not clients[client_socket].disconnected}
+
+# Handlers
+def handle_reading_sockets(clients, sockets, logger):
+    incoming_objects = []
+    for socket in sockets:
+        if socket not in clients:
+            client_socket, address = socket.accept()
+            client_socket.setblocking(False)
+            clients[client_socket] = make_client(address)
+            logger.debug("New client {0}".format(clients[client_socket]))
+        else:
+            client = clients[socket]
+            try:
+                disconnect = False
+                incoming_objects, disconnect = handle_read(reading_socket, client)
+            except Exception as e:
+                logger.warning("handle_read, client {0}: {1}".format(client, e))
+                disconnect = True
+            finally:
+                if disconnect:
+                    clients[socket] = disconnect_client(client)
+
+    return incoming_objects, clients
+
+def handle_writing_sockets(clients, sockets, logger):
+    for socket in sockets:
+        client = clients[socket]
+        try:
+            disconnect = False
+            disconnect = handle_write(socket, client)
+        except Exception as e:
+            logger.warning("handle_write, client {0}: {1}".format(client, e))
+            disconnect = True
+        finally:
+            if disconnect:
+                clients[socket] = disconnect_client(client)
+
+    return clients
 
 
 def main():
@@ -63,62 +100,29 @@ def main():
 
     reading_sockets = [listening_socket]
     writing_sockets = []
-    exceptional_sockets = []
 
     initial_clients = {}
     current_clients = initial_clients
     while True:
-        logger.debug(repr([reading_sockets, writing_sockets, exceptional_sockets]))
+        logger.debug(repr([reading_sockets, writing_sockets]))
         (reading_sockets,
-         writing_sockets,
-         exceptional_sockets) = select.select(reading_sockets,
-                                              writing_sockets,
-                                              exceptional_sockets, SELECT_TIMEOUT)
-        logger.debug(repr([reading_sockets, writing_sockets, exceptional_sockets]))
+         writing_sockets, _) = select.select(reading_sockets, writing_sockets, [],
+                                             SELECT_TIMEOUT)
+        logger.debug(repr([reading_sockets, writing_sockets]))
 
-        for reading_socket in reading_sockets:
-            if reading_socket not in current_clients:
-                client_socket, address = reading_socket.accept()
-                client_socket.setblocking(False)
-                current_clients[client_socket] = make_client(address)
-                logger.debug("New client {0}".format(current_clients[client_socket]))
-            else:
-                try:
-                    incoming_objects, disconnect = handle_read(reading_socket, current_clients[reading_socket])
-                except Exception as e:
-                    logger.warning("handle_read, client {0}: {1}".format(client, e))
-                    disconnect = True
-                finally:
-                    if disconnect:
-                        current_clients[reading_socket] = disconnect_client(client)
-
-        for writing_socket in writing_sockets:
-            client = current_clients[writing_socket]
-            try:
-                disconnect = handle_write(writing_socket, client)
-            except Exception as e:
-                logger.warning("handle_write, client {0}: {1}".format(client, e))
-                disconnect = True
-            finally:
-                if disconnect:
-                    current_clients[writing_socket] = disconnect_client(client)
-
-        for exceptional_socket in exceptional_sockets:
-            # TODO: what is this good for?
-            pass
+        incoming_objects, current_clients = handle_reading_sockets(current_clients, reading_sockets, logger)
+        current_clients = handle_writing_sockets(current_clients, writing_sockets, logger)
 
         current_clients = remove_disconnected(current_clients, logger)
 
+        # Sockets for next round
         reading_sockets = [listening_socket]
         writing_sockets = []
-        exceptional_sockets = []
         for client_socket, client in current_clients.items():
             reading_sockets.append(client_socket)
 
             if len(client.send_buffer) > 0:
                 writing_sockets.append(client_socket)
-
-            # TODO: exceptional?
 
         logger.debug('----')
 
