@@ -1,170 +1,126 @@
 #!/usr/bin/env python3
 # -*- mode: Python; indent: 4 -*-
-import socket as _socket
+import socket as socket_module
 import time
 import select
 import json
 import logging
 import sys
+import collections
 
 METADATA_MAX_SIZE = 2048
 PAYLOAD_MAX_SIZE = 10485760 # 10 megabytes
+SELECT_TIMEOUT = 10
 
-class ClientState:
-    def __init__(self, address):
-        self.address = address
+# Data structures and helpers
+Client = collections.namedtuple("Client", ["address", "send_buffer", "receive_buffer", "disconnected"])
 
-        self.metadata_buffer = bytes()
-        self.metadata_received = False
+def with_send_buffer(client, buffer):
+    return Client(address=client.address,
+                  send_buffer=buffer,
+                  receive_buffer=client.receive_buffer,
+                  disconnected=client.disconnected)
 
-        self.leftover_buffer = bytes()
-        self.payload_buffer = bytes()
-        self.payload_size = None
+def with_receive_buffer(client, buffer):
+    return Client(address=client.address,
+                  send_buffer=client.send_buffer,
+                  receive_buffer=buffer,
+                  disconnected=client.disconnected)
 
-        self.send_queue = []
-        self.send_buffer = bytes()
+def make_client(address):
+    return Client(address=address, send_buffer=bytes(), receive_buffer=bytes(), disconnected=False)
 
-        self.disconnect = False
+def disconnect_client(client):
+    return Client(address=client.address,
+                  send_buffer=client.send_buffer,
+                  receive_buffer=client.receive_buffer,
+                  disconnected=True)
 
-    def __str__(self):
-        return "<ClientState {0}>".format(self.address)
+
+def remove_disconnected(clients, logger):
+    disconnected = {client_socket:clients[client_socket]
+                    for client_socket in clients
+                    if clients[client_socket].disconnected}
+
+    for client_socket, client in disconnected.items():
+        logger.warn("Disconnecting {0}".format(client))
+        client_socket.close()
+
+    return {client_socket:clients[client_socket]
+            for client_socket in clients
+            if not clients[client_socket].disconnected}
 
 
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(sys.argv[0])
+def main():
+    # Set up logging
+    logging.basicConfig(level=logging.DEBUG)
+    logger = logging.getLogger(sys.argv[0])
 
-socket = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-socket.bind(("localhost", 7890))
-socket.listen(5)
+    # Open listening socket
+    listening_socket = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
+    listening_socket.bind(("localhost", 7890))
+    listening_socket.listen(5)
 
-clients = {}
-while True:
-    removables = set()
-    for client_socket, client in clients.items():
-        if client.disconnect:
-            logger.warn("Disconnecting {0}".format(client))
-            removables.add(client_socket)
-    for removable in removables:
-        removable.close()
-        del clients[removable]
+    reading_sockets = [listening_socket]
+    writing_sockets = []
+    exceptional_sockets = []
 
-    read_list = [socket]
-    write_list = []
-    exceptional_list = [socket]
+    initial_clients = {}
+    current_clients = initial_clients
+    while True:
+        logger.debug(repr([reading_sockets, writing_sockets, exceptional_sockets]))
+        (reading_sockets,
+         writing_sockets,
+         exceptional_sockets) = select.select(reading_sockets,
+                                              writing_sockets,
+                                              exceptional_sockets, SELECT_TIMEOUT)
+        logger.debug(repr([reading_sockets, writing_sockets, exceptional_sockets]))
 
-    for client_socket, client in clients.items():
-        if client.metadata_received is False or client.payload_size is not None:
-            read_list.append(client_socket)
-        if len(client.send_queue) or len(client.send_buffer) > 0:
-            write_list.append(client_socket)
+        for reading_socket in reading_sockets:
+            if reading_socket not in current_clients:
+                client_socket, address = reading_socket.accept()
+                client_socket.setblocking(False)
+                current_clients[client_socket] = make_client(address)
+                logger.debug("New client {0}".format(current_clients[client_socket]))
+            else:
+                try:
+                    incoming_objects, disconnect = handle_read(reading_socket, current_clients[reading_socket])
+                except Exception as e:
+                    logger.warning("handle_read, client {0}: {1}".format(client, e))
+                    disconnect = True
+                finally:
+                    if disconnect:
+                        current_clients[reading_socket] = disconnect_client(client)
 
-    rlist, wlist, xlist = select.select(read_list, write_list, exceptional_list, 1)
-
-    for client_socket in rlist:
-        if client_socket not in clients:
-            client_socket, address = socket.accept()
-            client_socket.setblocking(False)
-            clients[client_socket] = ClientState(address)
-            logger.debug("Added new client {0}".format(clients[client_socket]))
-        else:
-            logger.debug("Handling client {0}".format(clients[client_socket]))
-        client = clients[client_socket]
-
-        if client.metadata_received is False:
-            if len(client.leftover_buffer) > 0 and len(client.metadata_buffer) == 0:
-                client.metadata_buffer = client.leftover_buffer
-                if len(client.metadata_buffer) > 0 and client.metadata_buffer[0] == 0:
-                    client.metadata_buffer = client.metadata_buffer[1:]
-                client.leftover_buffer = bytes()
-
-            bytes_left = METADATA_MAX_SIZE - len(client.metadata_buffer)
+        for writing_socket in writing_sockets:
+            client = current_clients[writing_socket]
             try:
-                received = client_socket.recv(bytes_left)
-            except _socket.error as se:
-                client.disconnected = True
-                continue
+                disconnect = handle_write(writing_socket, client)
+            except Exception as e:
+                logger.warning("handle_write, client {0}: {1}".format(client, e))
+                disconnect = True
+            finally:
+                if disconnect:
+                    current_clients[writing_socket] = disconnect_client(client)
 
-            metadata_bytes_received = len(client.metadata_buffer) + len(received)
+        for exceptional_socket in exceptional_sockets:
+            # TODO: what is this good for?
+            pass
 
-            nul_index = None
-            for i in range(len(received)):
-                c = received[i]
-                if c == 0:
-                    nul_index = i
-                    break
+        current_clients = remove_disconnected(current_clients, logger)
 
-            if nul_index is None and metadata_bytes_received == METADATA_MAX_SIZE:
-                logger.error("Never encountered nul, closing socket {0}".format(client))
-                client.disconnect = True
-            elif nul_index is None and metadata_bytes_received < METADATA_MAX_SIZE:
-                if len(received) == 0: # on rlist and nothing to read => error
-                    client.disconnect = True
-                    continue
-                logger.debug("Still some metadata left")
-                logger.debug(client.metadata_buffer)
-            elif nul_index is None:
-                raise Exception("Seems like we've read more than we should have, epic fail")
-            elif nul_index is not None:
-                client.metadata_buffer = client.metadata_buffer + received[0:nul_index]
-                client.leftover_buffer = received[nul_index:]
-                logger.debug(client.metadata_buffer)
-                metadata = json.loads(client.metadata_buffer.decode('utf-8', 'strict'))
-                logger.debug("Received {0} from {1}".format(metadata, client))
-                client.metadata_received = True
+        reading_sockets = [listening_socket]
+        writing_sockets = []
+        exceptional_sockets = []
+        for client_socket, client in current_clients.items():
+            reading_sockets.append(client_socket)
 
-                payload_size = metadata.get('size', 0)
-                if payload_size > 0:
-                    if payload_size > PAYLOAD_MAX_SIZE:
-                        logger.error("Too large payload object {0} > {1}".format(payload_size, PAYLOAD_MAX_SIZE))
-                        client.disconnect = True
-                    else:
-                        client.payload_size = payload_size
-                        logger.debug("Payload of size {0} for {1}".format(payload_size, client))
-                else:
-                    for client in clients.values():
-                        client.send_queue.append((metadata, None))
-                    client.metadata_received = False
-                    client.metadata_buffer = bytes()
-        elif client.metadata_received is True and client.disconnect is False:
-            if len(client.leftover_buffer) > 0:
-                client.payload_buffer = client.leftover_buffer
-                client.leftover_buffer = bytes()
+            if len(client.send_buffer) > 0:
+                writing_sockets.append(client_socket)
 
-            bytes_left = PAYLOAD_MAX_SIZE - len(client.payload_buffer)
-            try:
-                received = client_socket.recv(bytes_left)
-            except _socket.error as se:
-                client.disconnected = True
-                continue
+            # TODO: exceptional?
 
-            payload_bytes_received = len(client.payload_buffer) + len(received)
+        logger.debug('----')
 
-            if payload_bytes_received < client.payload_size:
-                client.payload_buffer = client.payload_buffer + received
-            elif payload_bytes_received == client.payload_size:
-                client.payload_size = None
-                for client in clients.values():
-                    client.send_queue.append((metadata, client.payload_buffer))
-                client.metadata_buffer = bytes()
-                client.payload_buffer = bytes()
-
-    for client_socket in wlist:
-        client = clients[client_socket]
-        if client.disconnect is True:
-            continue
-
-        for metadata, payload in client.send_queue:
-            if payload is None:
-                payload = bytes()
-            client.send_buffer = client.send_buffer + \
-                                 json.dumps(metadata).encode('utf-8') + b'\00' + payload
-        client.send_queue = []
-
-        if len(client.send_buffer) > 0:
-            try:
-                sent_bytes = client_socket.send(client.send_buffer)
-            except _socket.error as se:
-                logger.warning("Received {0} from {1}".format(se, client))
-                client.send_buffer = bytes()
-                client.disconnect = True
-            client.send_buffer = client.send_buffer[sent_bytes:]
+if __name__ == '__main__':
+    main()
