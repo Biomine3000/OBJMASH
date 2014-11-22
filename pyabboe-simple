@@ -62,7 +62,8 @@ def handle_reading_sockets(clients, sockets, logger):
             client = clients[socket]
             try:
                 disconnect = False
-                incoming_objects, disconnect = handle_read(reading_socket, client)
+                incoming_objects, client, disconnect = handle_read(socket, client, logger)
+                clients[socket] = client
             except Exception as e:
                 logger.warning("handle_read, client {0}: {1}".format(client, e))
                 disconnect = True
@@ -77,7 +78,8 @@ def handle_writing_sockets(clients, sockets, logger):
         client = clients[socket]
         try:
             disconnect = False
-            disconnect = handle_write(socket, client)
+            disconnect, client = handle_write(socket, client, logger)
+            clients[socket] = client
         except Exception as e:
             logger.warning("handle_write, client {0}: {1}".format(client, e))
             disconnect = True
@@ -86,6 +88,62 @@ def handle_writing_sockets(clients, sockets, logger):
                 clients[socket] = disconnect_client(client)
 
     return clients
+
+def first_nul(buffer):
+    for i in range(len(buffer)):
+        if buffer[i] == 0:
+            return i
+
+def parse_metadata(buffer):
+    nul_index = first_nul(buffer)
+    return (json.loads(buffer[:nul_index].decode('utf-8', 'strict')),
+            buffer[nul_index + 1:])
+
+def handle_read(socket, client, logger):
+    disconnect = False
+
+    metadata_received = False
+    if len(client.receive_buffer) > 0:
+        if first_nul(client.receive_buffer) is not None:
+            metadata_received = True
+
+    if metadata_received is False:
+        bytes_left = METADATA_MAX_SIZE - len(client.receive_buffer)
+        if bytes_left == 0:
+            logger.warning("No metadata received within the METADATA_MAX_SIZE limit.")
+            return [], client, True
+
+        received = socket.recv(bytes_left)
+
+        # On the read list and nothing to read. Signals disconnection.
+        if len(received) == 0:
+            logger.info("Client disconnected.")
+            return [], client, True
+
+        client = with_receive_buffer(client, client.receive_buffer + received)
+
+    if len(client.receive_buffer) > 0:
+        nul_index = first_nul(client.receive_buffer)
+        if nul_index is not None:
+            metadata_received = True
+
+    if not metadata_received:
+        return [], client, False
+
+    objects = []
+    while True:
+        metadata, receive_buffer = parse_metadata(client.receive_buffer)
+        client = with_receive_buffer(client, receive_buffer)
+        objects.append((metadata, None))
+
+        if metadata.get('size', 0) > 0:
+            raise Exception("Cannot handle payloads yet")
+
+        nul_index = first_nul(client.receive_buffer)
+        if nul_index is None:
+            break
+
+    return objects, client, False
 
 
 def main():
@@ -105,12 +163,22 @@ def main():
     current_clients = initial_clients
     while True:
         logger.debug(repr([reading_sockets, writing_sockets]))
-        (reading_sockets,
-         writing_sockets, _) = select.select(reading_sockets, writing_sockets, [],
-                                             SELECT_TIMEOUT)
+
+        try:
+            (reading_sockets,
+             writing_sockets, _) = select.select(reading_sockets, writing_sockets, [],
+                                                 SELECT_TIMEOUT)
+        except KeyboardInterrupt as kbi:
+            for client_socket in current_clients:
+                client_socket.close()
+            listening_socket.close()
+            raise kbi
+
         logger.debug(repr([reading_sockets, writing_sockets]))
 
         incoming_objects, current_clients = handle_reading_sockets(current_clients, reading_sockets, logger)
+
+        print(incoming_objects)
         current_clients = handle_writing_sockets(current_clients, writing_sockets, logger)
 
         current_clients = remove_disconnected(current_clients, logger)
