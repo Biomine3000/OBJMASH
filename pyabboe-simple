@@ -16,37 +16,29 @@ SELECT_TIMEOUT = 10
 Client = collections.namedtuple("Client", ["address", "send_buffer", "receive_buffer", "disconnected"])
 
 def with_send_buffer(client, buffer):
-    return Client(address=client.address,
-                  send_buffer=buffer,
-                  receive_buffer=client.receive_buffer,
-                  disconnected=client.disconnected)
+    return Client(address=client.address, send_buffer=buffer,
+                  receive_buffer=client.receive_buffer, disconnected=client.disconnected)
 
 def with_receive_buffer(client, buffer):
-    return Client(address=client.address,
-                  send_buffer=client.send_buffer,
-                  receive_buffer=buffer,
-                  disconnected=client.disconnected)
+    return Client(address=client.address, send_buffer=client.send_buffer,
+                  receive_buffer=buffer, disconnected=client.disconnected)
 
 def make_client(address):
     return Client(address=address, send_buffer=bytes(), receive_buffer=bytes(), disconnected=False)
 
 def disconnect_client(client):
-    return Client(address=client.address,
-                  send_buffer=client.send_buffer,
-                  receive_buffer=client.receive_buffer,
-                  disconnected=True)
+    return Client(address=client.address, send_buffer=client.send_buffer,
+                  receive_buffer=client.receive_buffer, disconnected=True)
 
 def remove_disconnected(clients, logger):
-    disconnected = {client_socket:clients[client_socket]
-                    for client_socket in clients
+    disconnected = {client_socket:clients[client_socket] for client_socket in clients
                     if clients[client_socket].disconnected}
 
     for client_socket, client in disconnected.items():
         logger.warn("Disconnecting {0}".format(client))
         client_socket.close()
 
-    return {client_socket:clients[client_socket]
-            for client_socket in clients
+    return {client_socket:clients[client_socket] for client_socket in clients
             if not clients[client_socket].disconnected}
 
 # Handlers
@@ -57,7 +49,7 @@ def handle_reading_sockets(clients, sockets, logger):
             client_socket, address = socket.accept()
             client_socket.setblocking(False)
             clients[client_socket] = make_client(address)
-            logger.debug("New client {0}".format(clients[client_socket]))
+            logger.info("New client {0}".format(clients[client_socket]))
         else:
             client = clients[socket]
             try:
@@ -88,6 +80,17 @@ def handle_writing_sockets(clients, sockets, logger):
                 clients[socket] = disconnect_client(client)
 
     return clients
+
+def handle_write(socket, client, logger):
+    disconnect = False
+    sent_bytes = 0
+    try:
+        sent_bytes = socket.send(client.send_buffer)
+    except socket_module.error as se:
+        logger.warning("Received {0} from {1}".format(se, client))
+        disconnect = True
+    return disconnect, with_send_buffer(client, client.send_buffer[sent_bytes:])
+
 
 def first_nul(buffer):
     for i in range(len(buffer)):
@@ -177,8 +180,7 @@ def main():
         logger.debug(repr([reading_sockets, writing_sockets]))
 
         incoming_objects, current_clients = handle_reading_sockets(current_clients, reading_sockets, logger)
-
-        print(incoming_objects)
+        # print(incoming_objects)
         current_clients = handle_writing_sockets(current_clients, writing_sockets, logger)
 
         current_clients = remove_disconnected(current_clients, logger)
