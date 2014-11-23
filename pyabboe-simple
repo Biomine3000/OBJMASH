@@ -13,22 +13,23 @@ PAYLOAD_MAX_SIZE = 10485760 # 10 megabytes
 SELECT_TIMEOUT = 10
 
 # Data structures and helpers
-Client = collections.namedtuple("Client", ["address", "send_buffer", "receive_buffer", "disconnected"])
+_ClientBase = collections.namedtuple("Client", ["address", "send_buffer", "receive_buffer", "disconnected"])
 
-def with_send_buffer(client, buffer):
-    return Client(address=client.address, send_buffer=buffer,
-                  receive_buffer=client.receive_buffer, disconnected=client.disconnected)
+class Client(_ClientBase):
+    def with_send_buffer(self, buffer):
+        return Client(address=self.address, send_buffer=buffer,
+                      receive_buffer=self.receive_buffer, disconnected=self.disconnected)
 
-def with_receive_buffer(client, buffer):
-    return Client(address=client.address, send_buffer=client.send_buffer,
-                  receive_buffer=buffer, disconnected=client.disconnected)
+    def with_receive_buffer(self, buffer):
+        return Client(address=self.address, send_buffer=self.send_buffer,
+                      receive_buffer=buffer, disconnected=self.disconnected)
 
-def make_client(address):
-    return Client(address=address, send_buffer=bytes(), receive_buffer=bytes(), disconnected=False)
+    def from_address(address):
+        return Client(address=address, send_buffer=bytes(), receive_buffer=bytes(), disconnected=False)
 
-def disconnect_client(client):
-    return Client(address=client.address, send_buffer=client.send_buffer,
-                  receive_buffer=client.receive_buffer, disconnected=True)
+    def as_disconnected(self):
+        return Client(address=self.address, send_buffer=self.send_buffer,
+                      receive_buffer=self.receive_buffer, disconnected=True)
 
 def remove_disconnected(clients, logger):
     disconnected = {client_socket:clients[client_socket] for client_socket in clients
@@ -48,20 +49,16 @@ def handle_reading_sockets(clients, sockets, logger):
         if socket not in clients:
             client_socket, address = socket.accept()
             client_socket.setblocking(False)
-            clients[client_socket] = make_client(address)
+            clients[client_socket] = Client.from_address(address)
             logger.info("New client {0}".format(clients[client_socket]))
         else:
             client = clients[socket]
             try:
-                disconnect = False
-                incoming_objects, client, disconnect = handle_read(socket, client, logger)
+                incoming_objects, client = handle_read(socket, client, logger)
                 clients[socket] = client
             except Exception as e:
                 logger.warning("handle_read, client {0}: {1}".format(client, e))
-                disconnect = True
-            finally:
-                if disconnect:
-                    clients[socket] = disconnect_client(client)
+                clients[socket] = client.as_disconnected()
 
     return incoming_objects, clients
 
@@ -69,27 +66,23 @@ def handle_writing_sockets(clients, sockets, logger):
     for socket in sockets:
         client = clients[socket]
         try:
-            disconnect = False
-            disconnect, client = handle_write(socket, client, logger)
+            client = handle_write(socket, client, logger)
             clients[socket] = client
         except Exception as e:
             logger.warning("handle_write, client {0}: {1}".format(client, e))
-            disconnect = True
-        finally:
-            if disconnect:
-                clients[socket] = disconnect_client(client)
+            clients[socket] = client.as_disconnected()
 
     return clients
 
 def handle_write(socket, client, logger):
-    disconnect = False
     sent_bytes = 0
     try:
         sent_bytes = socket.send(client.send_buffer)
     except socket_module.error as se:
         logger.warning("Received {0} from {1}".format(se, client))
-        disconnect = True
-    return disconnect, with_send_buffer(client, client.send_buffer[sent_bytes:])
+        return client.as_disconnected()
+
+    return client.with_send_buffer(client.send_buffer[sent_bytes:])
 
 
 def first_nul(buffer):
@@ -103,8 +96,6 @@ def parse_metadata(buffer):
             buffer[nul_index + 1:])
 
 def handle_read(socket, client, logger):
-    disconnect = False
-
     metadata_received = False
     if len(client.receive_buffer) > 0:
         if first_nul(client.receive_buffer) is not None:
@@ -114,16 +105,16 @@ def handle_read(socket, client, logger):
         bytes_left = METADATA_MAX_SIZE - len(client.receive_buffer)
         if bytes_left == 0:
             logger.warning("No metadata received within the METADATA_MAX_SIZE limit.")
-            return [], client, True
+            return [], client.as_disconnected()
 
         received = socket.recv(bytes_left)
 
         # On the read list and nothing to read. Signals disconnection.
         if len(received) == 0:
             logger.info("Client disconnected.")
-            return [], client, True
+            return [], client.as_disconnected()
 
-        client = with_receive_buffer(client, client.receive_buffer + received)
+        client = client.with_receive_buffer(client.receive_buffer + received)
 
     if len(client.receive_buffer) > 0:
         nul_index = first_nul(client.receive_buffer)
@@ -131,22 +122,23 @@ def handle_read(socket, client, logger):
             metadata_received = True
 
     if not metadata_received:
-        return [], client, False
+        return [], client
 
     objects = []
     while True:
         metadata, receive_buffer = parse_metadata(client.receive_buffer)
-        client = with_receive_buffer(client, receive_buffer)
-        objects.append((metadata, None))
+        client = client.with_receive_buffer(receive_buffer)
 
         if metadata.get('size', 0) > 0:
             raise Exception("Cannot handle payloads yet")
+
+        objects.append((metadata, None))
 
         nul_index = first_nul(client.receive_buffer)
         if nul_index is None:
             break
 
-    return objects, client, False
+    return objects, client
 
 
 def main():
