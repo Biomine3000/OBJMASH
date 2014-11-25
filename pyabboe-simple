@@ -31,15 +31,9 @@ class Client(_ClientBase):
         return Client(address=self.address, send_buffer=self.send_buffer,
                       receive_buffer=self.receive_buffer, disconnected=True)
 
-def remove_disconnected(clients, logger):
-    disconnected = {client_socket:clients[client_socket] for client_socket in clients
-                    if clients[client_socket].disconnected}
-
-    for client_socket, client in disconnected.items():
-        logger.warn("Disconnecting {0}".format(client))
-        client_socket.close()
-
-    return {client_socket:clients[client_socket] for client_socket in clients
+def without_disconnected(clients, logger):
+    return {client_socket:clients[client_socket]
+            for client_socket in clients
             if not clients[client_socket].disconnected}
 
 # Handlers
@@ -175,7 +169,12 @@ def main():
         # print(incoming_objects)
         current_clients = handle_writing_sockets(current_clients, writing_sockets, logger)
 
-        current_clients = remove_disconnected(current_clients, logger)
+        for client_socket, client in current_clients.items():
+            if client.disconnected:
+                logger.warn("Disconnecting {0}".format(client))
+                client_socket.close()
+
+        current_clients = without_disconnected(current_clients, logger)
 
         # Sockets for next round
         reading_sockets = [listening_socket]
