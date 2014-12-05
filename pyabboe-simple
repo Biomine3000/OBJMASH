@@ -175,7 +175,9 @@ def handle_subscription_event(socket, client, metadata):
 
     response_metadata = {'event': 'routing/subscribe/reply',
                          'receive-mode': receive_mode,
-                         'subscriptions': subscriptions }
+                         'subscriptions': subscriptions}
+    if 'id' in metadata:
+        response_metadata['in-reply-to'] = metadata['id']
 
     return client \
         .with_subscriptions(subscriptions) \
