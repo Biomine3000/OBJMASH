@@ -13,31 +13,60 @@ PAYLOAD_MAX_SIZE = 10485760 # 10 megabytes
 SELECT_TIMEOUT = 10
 
 # Data structures and helpers
-_ClientBase = collections.namedtuple("Client", ["address", "send_buffer", "receive_buffer", "disconnected"])
+_ClientBase = collections.namedtuple("Client", ["address", "send_buffer", "receive_buffer",
+                                                "disconnected", "subscriptions", "receive_mode"])
+
+bn = sys.argv[0].strip('.').strip('/')
+def lg(name=None):
+    if name is None:
+        return logging.getLogger(bn)
+    else:
+        return logging.getLogger(bn + "." + name)
 
 class Client(_ClientBase):
-    def with_send_buffer(self, buffer):
-        return Client(address=self.address, send_buffer=buffer,
-                      receive_buffer=self.receive_buffer, disconnected=self.disconnected)
-
-    def with_receive_buffer(self, buffer):
-        return Client(address=self.address, send_buffer=self.send_buffer,
-                      receive_buffer=buffer, disconnected=self.disconnected)
+    def _attr_substituted(self, attr_name, value):
+        # attrs = vars(self)
+        attrs = self._asdict()
+        attrs[attr_name] = value
+        return attrs
 
     def from_address(address):
-        return Client(address=address, send_buffer=bytes(), receive_buffer=bytes(), disconnected=False)
+        return Client(address=address, send_buffer=bytes(), receive_buffer=bytes(),
+                      disconnected=False, subscriptions=None, receive_mode=None)
+
+    def with_send_buffer(self, buffer):
+        return Client(**self._attr_substituted('send_buffer', buffer))
+
+    def with_receive_buffer(self, buffer):
+        return Client(**self._attr_substituted('receive_buffer', buffer))
+
+    def with_subscriptions(self, subscriptions):
+        return Client(**self._attr_substituted('subscriptions', subscriptions))
+
+    def with_receive_mode(self, receive_mode):
+        return Client(**self._attr_substituted('receive_mode', receive_mode))
 
     def as_disconnected(self):
-        return Client(address=self.address, send_buffer=self.send_buffer,
-                      receive_buffer=self.receive_buffer, disconnected=True)
+        print(self._attr_substituted('disconnected', True))
+        return Client(**self._attr_substituted('disconnected', True))
 
-def without_disconnected(clients, logger):
+
+def without_disconnected(clients):
     return {client_socket:clients[client_socket]
             for client_socket in clients
             if not clients[client_socket].disconnected}
 
+def with_closed_sockets(clients):
+    logger = lg()
+    for socket, client in clients.items():
+        if client.disconnected:
+            logger.warn("Disconnecting {0}".format(client))
+            socket.close()
+    return clients
+
 # Handlers
-def handle_reading_sockets(clients, sockets, logger):
+def handle_reading_sockets(clients, sockets):
+    logger = lg('read')
     incoming_objects = []
     for socket in sockets:
         if socket not in clients:
@@ -48,7 +77,7 @@ def handle_reading_sockets(clients, sockets, logger):
         else:
             client = clients[socket]
             try:
-                incoming_objects, client = handle_read(socket, client, logger)
+                incoming_objects, client = handle_read(socket, client)
                 clients[socket] = client
             except Exception as e:
                 logger.warning("handle_read, client {0}: {1}".format(client, e))
@@ -56,11 +85,12 @@ def handle_reading_sockets(clients, sockets, logger):
 
     return incoming_objects, clients
 
-def handle_writing_sockets(clients, sockets, logger):
+def handle_writing_sockets(clients, sockets):
+    logger = lg('write')
     for socket in sockets:
         client = clients[socket]
         try:
-            client = handle_write(socket, client, logger)
+            client = handle_write(socket, client)
             clients[socket] = client
         except Exception as e:
             logger.warning("handle_write, client {0}: {1}".format(client, e))
@@ -68,10 +98,12 @@ def handle_writing_sockets(clients, sockets, logger):
 
     return clients
 
-def handle_write(socket, client, logger):
+def handle_write(socket, client):
+    logger = lg('write')
     sent_bytes = 0
     try:
         sent_bytes = socket.send(client.send_buffer)
+        lg('traffic').debug("Sent {0} bytes to {1}".format(sent_bytes, client))
     except socket_module.error as se:
         logger.warning("Received {0} from {1}".format(se, client))
         return client.as_disconnected()
@@ -89,7 +121,8 @@ def parse_metadata(buffer):
     return (json.loads(buffer[:nul_index].decode('utf-8', 'strict')),
             buffer[nul_index + 1:])
 
-def handle_read(socket, client, logger):
+def handle_read(socket, client):
+    logger = lg('read')
     metadata_received = False
     if len(client.receive_buffer) > 0:
         if first_nul(client.receive_buffer) is not None:
@@ -109,6 +142,7 @@ def handle_read(socket, client, logger):
             return [], client.as_disconnected()
 
         client = client.with_receive_buffer(client.receive_buffer + received)
+        lg('traffic').debug("Received {0} bytes from {1}".format(len(received), client))
 
     if len(client.receive_buffer) > 0:
         nul_index = first_nul(client.receive_buffer)
@@ -126,7 +160,7 @@ def handle_read(socket, client, logger):
         if metadata.get('size', 0) > 0:
             raise Exception("Cannot handle payloads yet")
 
-        objects.append((metadata, None))
+        objects.append((socket, metadata, None))
 
         nul_index = first_nul(client.receive_buffer)
         if nul_index is None:
@@ -134,11 +168,70 @@ def handle_read(socket, client, logger):
 
     return objects, client
 
+def handle_subscription_event(socket, client, metadata):
+    # TODO validate subscriptions / receive-mode?
+    subscriptions = metadata.get('subscriptions', ['*'])
+    receive_mode = metadata.get('receive-mode', 'all')
+
+    response_metadata = {'event': 'routing/subscribe/reply',
+                         'receive-mode': receive_mode,
+                         'subscriptions': subscriptions }
+
+    return client \
+        .with_subscriptions(subscriptions) \
+        .with_receive_mode(receive_mode) \
+        .with_send_buffer(client.send_buffer + json.dumps(response_metadata).encode('utf-8') + '\\0'.encode('utf-8'))
+
+def handle_ping_event(socket, client, metadata):
+    return client \
+        .with_send_buffer(client.send_buffer + json.dumps({'event': 'pong'}))
+
+def handle_events(objects, clients):
+    logger = lg()
+    multiplexable_objects = []
+    response_events = []
+    result_clients = dict(clients)
+    for client_socket, metadata, payload in objects:
+        if not 'event' in metadata:
+            multiplexable_objects.append((client_socket, metadata, payload))
+            continue
+
+        client = clients.get(client_socket, None)
+        if client is None:
+            raise Exception("Event source client not in clients: inconsistent state")
+
+        event_type = metadata.get('event', None)
+
+        if event_type == 'routing/subscribe':
+            client = handle_subscription_event(client_socket, client, metadata)
+            logger.debug('{0} subscribed'.format(client))
+            result_clients[client_socket] = client
+            response_events.append(({'event': 'routing/subscribe/notification'}))
+        elif event_type == 'ping':
+            client = handle_ping_event(client_socket, client, metadata)
+            result_clients[client_socket] = client
+
+    return multiplexable_objects, response_events, result_clients
+
+def multiplex(clients, objects):
+    logger = lg('multiplex')
+    for obj in objects:
+        _, metadata, payload = obj
+        if metadata.get('size', 0) == 0:
+            bts = json.dumps(metadata).encode('utf-8') + '\\0'.encode('utf-8')
+        else:
+            bts = json.dumps(metadata).encode('utf-8') + '\\0'.encode('utf-8') + payload
+
+        for socket, client in clients.items():
+            logger.debug('Sending {0} to {1}'.format(obj, client))
+            clients[socket] = client \
+                .with_send_buffer(client.send_buffer + bts)
+    return clients
 
 def main():
     # Set up logging
     logging.basicConfig(level=logging.DEBUG)
-    logger = logging.getLogger(sys.argv[0])
+    logger = lg('select')
 
     # Open listening socket
     listening_socket = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
@@ -165,16 +258,15 @@ def main():
 
         logger.debug(repr([reading_sockets, writing_sockets]))
 
-        incoming_objects, current_clients = handle_reading_sockets(current_clients, reading_sockets, logger)
-        # print(incoming_objects)
-        current_clients = handle_writing_sockets(current_clients, writing_sockets, logger)
+        incoming_objects, current_clients = handle_reading_sockets(current_clients, reading_sockets)
+        current_clients = without_disconnected(with_closed_sockets(current_clients))
 
-        for client_socket, client in current_clients.items():
-            if client.disconnected:
-                logger.warn("Disconnecting {0}".format(client))
-                client_socket.close()
+        multiplexable_objects, response_events, current_clients = handle_events(incoming_objects, current_clients)
 
-        current_clients = without_disconnected(current_clients, logger)
+        current_clients = multiplex(current_clients, multiplexable_objects)
+
+        current_clients = handle_writing_sockets(current_clients, writing_sockets)
+        current_clients = without_disconnected(with_closed_sockets(current_clients))
 
         # Sockets for next round
         reading_sockets = [listening_socket]
