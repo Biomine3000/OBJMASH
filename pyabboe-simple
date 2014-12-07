@@ -8,6 +8,7 @@ import logging
 import sys
 import collections
 import traceback
+import email.utils
 
 NUL = '\x00'.encode('utf-8')
 
@@ -20,12 +21,12 @@ SELECT_TIMEOUT = 10
 _ClientBase = collections.namedtuple("Client", ["address", "send_buffer", "receive_buffer",
                                                 "disconnected", "subscriptions", "receive_mode"])
 
-bn = sys.argv[0].strip('.').strip('/')
+logger_basename = sys.argv[0].strip('.').strip('/')
 def lg(name=None):
     if name is None:
-        return logging.getLogger(bn)
+        return logging.getLogger(logger_basename)
     else:
-        return logging.getLogger(bn + "." + name)
+        return logging.getLogger(logger_basename + "." + name)
 
 class Client(_ClientBase):
     def _attr_substituted(self, attr_name, value):
@@ -51,9 +52,38 @@ class Client(_ClientBase):
         return Client(**self._attr_substituted('receive_mode', receive_mode))
 
     def as_disconnected(self):
-        print(self._attr_substituted('disconnected', True))
         return Client(**self._attr_substituted('disconnected', True))
 
+class BusinessObject(object):
+    def __init__(self, metadata_dict, payload):
+        self.metadata = metadata_dict
+        self.id = metadata_dict.get('id', email.utils.make_msgid())
+        self.payload = payload
+        self.size = metadata_dict.get('size', 0)
+        self.content_type = metadata_dict.get('type', None)
+        self.event = metadata_dict.get('event', None)
+
+    def __str__(self):
+        return "<{0} {1}>".format(self.__class__.__name__, self.content_type)
+
+    def __hash__(self):
+        return self.id.__hash__()
+
+    def __eq__(self, other):
+        return self.__hash__() == other.__hash__()
+
+    def serialize(self):
+        self.metadata['id'] = self.id
+        self.metadata['size'] = self.size
+        if self.content_type is not None:
+            self.metadata['type'] = str(self.content_type)
+
+        ret = bytearray(json.dumps(self.metadata).encode('utf-8'))
+        ret += NUL
+        if self.size > 0:
+            ret.extend(self.payload)
+
+        return ret
 
 def without_disconnected(clients):
     return {client_socket:clients[client_socket]
@@ -114,17 +144,16 @@ def handle_write(socket, client):
 
     return client.with_send_buffer(client.send_buffer[sent_bytes:])
 
-
-def first_nul(buffer):
-    for i in range(min(METADATA_MAX_SIZE, len(buffer))):
-        if buffer[i] == 0:
-            return i
-
 def parse_metadata(buffer, first_nul_index):
     return (json.loads(buffer[0:first_nul_index].decode('utf-8', 'strict')),
             buffer[first_nul_index + 1:])
 
 def is_metadata_received(client):
+    def first_nul(buffer):
+        for i in range(min(METADATA_MAX_SIZE, len(buffer))):
+            if buffer[i] == 0:
+                return i
+
     if len(client.receive_buffer) > 0:
         first_nul_index = first_nul(client.receive_buffer)
         if first_nul_index is not None:
@@ -136,7 +165,7 @@ def handle_read(socket, client):
 
     received = socket.recv(MAX_OBJECT_SIZE)
     if len(received) == 0:
-        lg('read').info("Client disconnected.")
+        lg('read').info("{0} disconnected".format(client))
         return [], client.as_disconnected()
 
     client = client.with_receive_buffer(client.receive_buffer + received)
@@ -164,7 +193,7 @@ def handle_read(socket, client):
             payload_length = None
 
         if payload_length is None or payload_length == 0:
-            objects.append((socket, metadata, None))
+            objects.append((socket, BusinessObject(metadata, None)))
             client = client.with_receive_buffer(remaining_buffer)
             continue
 
@@ -172,75 +201,11 @@ def handle_read(socket, client):
             break
 
         payload = remaining_buffer[0:payload_length]
-        objects.append((socket, metadata, payload))
+        objects.append((socket, BusinessObject(metadata, payload)))
         client = client.with_receive_buffer(remaining_buffer[payload_length:])
 
     return objects, client
 
-def handle_subscription_event(clients, socket, client, metadata):
-    result_clients = dict(clients)
-    # TODO validate subscriptions / receive-mode?
-    subscriptions = metadata.get('subscriptions', ['*'])
-    receive_mode = metadata.get('receive-mode', 'all')
-
-    response_metadata = {'event': 'routing/subscribe/reply',
-                         'receive-mode': receive_mode,
-                         'subscriptions': subscriptions}
-    if 'id' in metadata:
-        response_metadata['in-reply-to'] = metadata['id']
-
-    client = client \
-        .with_subscriptions(subscriptions) \
-        .with_receive_mode(receive_mode) \
-        .with_send_buffer(client.send_buffer + json.dumps(response_metadata).encode('utf-8') + NUL)
-    result_clients[socket] = client
-
-    for other_socket, other_client in clients.items():
-        if other_socket == socket:
-            continue
-        # TODO: routing/announcement
-        # notification = BusinessObject({ 'event': 'routing/subscribe/notification',
-        #                                 'routing-id': client.routing_id }, None)
-
-    return result_clients
-
-def handle_ping_event(socket, client, metadata):
-    if client.subscriptions is not None:
-        response_metadata = {'event': 'pong'}
-        if 'id' in metadata:
-            response_metadata['in-reply-to'] = metadata['id']
-
-        return client \
-            .with_send_buffer(client.send_buffer + json.dumps(response_metadata).encode('utf-8') + NUL)
-    else:
-        return client
-
-def handle_events(objects, clients):
-    logger = lg('event')
-    multiplexable_objects = []
-    response_events = []
-    result_clients = dict(clients)
-    for client_socket, metadata, payload in objects:
-        if not 'event' in metadata:
-            multiplexable_objects.append((client_socket, metadata, payload))
-            continue
-
-        logger.debug('Event {0} received from {1}'.format(metadata['event'], clients[client_socket]))
-
-        client = clients.get(client_socket, None)
-        if client is None:
-            raise Exception("Event source client not in clients: inconsistent state")
-
-        event_type = metadata.get('event', None)
-
-        if event_type == 'routing/subscribe':
-            result_clients = handle_subscription_event(result_clients, client_socket, client, metadata)
-            logger.debug('{0} subscribed'.format(client))
-        elif event_type == 'ping':
-            client = handle_ping_event(client_socket, client, metadata)
-            result_clients[client_socket] = client
-
-    return multiplexable_objects, response_events, result_clients
 
 def routing_decision(metadata, rules):
     def match(matcher, matchable):
@@ -279,7 +244,8 @@ def routing_decision(metadata, rules):
 
         elif rule.startswith('@'):
             rule = rule[1:]
-            if metadata.get('event', None) is not None and match(rule, message.event): # message.event == rule:
+            event = metadata.get('event', None)
+            if event is not None and match(rule, event): # message.event == rule:
                 PASS = not is_negative_rule
 
         elif rule == '*' or match(rule, metadata.get('type', None)):
@@ -287,21 +253,88 @@ def routing_decision(metadata, rules):
 
     return PASS
 
+def subscribe_client(clients, client, socket, subscription):
+    subscriptions = subscription.metadata.get('subscriptions', ['*'])
+    receive_mode = subscription.metadata.get('receive-mode', 'all')
 
-def multiplex(clients, objects):
-    logger = lg('multiplex')
-    for obj in objects:
-        _, metadata, payload = obj
-        if metadata.get('size', 0) == 0:
-            bts = json.dumps(metadata).encode('utf-8') + NUL
+    metadata = {'event': 'routing/subscribe/reply',
+                         'subscriptions': subscriptions,
+                         'receive-mode': receive_mode}
+
+    if 'id' in subscription.metadata:
+        metadata['in-reply-to'] = subscription.metadata['id']
+
+    client = client \
+        .with_subscriptions(subscriptions) \
+        .with_receive_mode(receive_mode) \
+        .with_send_buffer(BusinessObject(metadata, None).serialize())
+    result_clients = dict(clients)
+    result_clients[socket] = client
+
+    lg('subscribe-client').info("{0} subscribed".format(client))
+
+    notification_object = BusinessObject(
+        {'event': 'routing/subscribe/notification',
+         'subscriptions': subscriptions,
+         'receive-mode': receive_mode},
+        None)
+    for other_socket, other_client in clients.items():
+        if other_socket == socket:
+            continue
+        if other_client.receive_mode == 'none':
+            continue
+
+        result_clients[other_socket] = other_client \
+            .with_send_buffer(client.send_buffer + notification_object.serialize())
+
+    return result_clients, client
+
+def respond_to_ping(client, ping):
+    metadata = {'event': 'pong'}
+    if 'id' in ping.metadata:
+        metadata['in-reply-to'] = ping.metadata['id']
+    return client.with_send_buffer(client.send_buffer + BusinessObject(metadata, None).serialize())
+
+def handle_object(clients, socket_tuple):
+    socket, obj = socket_tuple
+    client = clients[socket]
+    result_clients = dict(clients)
+    event = obj.metadata.get('event', None)
+
+    if client.subscriptions is None:
+        if event == 'routing/subscribe':
+            result_clients, client = subscribe_client(result_clients, client, socket, obj)
+            # TODO: routing announcement
         else:
-            bts = json.dumps(metadata).encode('utf-8') + NUL + payload
+            client = client.as_disconnected()
+            lg('handle-object').warning(
+                "Unsubscribed client {0} sent something else than a subscription ({1})".format(client, event))
+    else:
+        if event == 'ping':
+            client = respond_to_ping(client, obj)
+        else:
+            for other_socket, other_client in result_clients.items():
+                if other_client.receive_mode == 'events_only' and event is None:
+                    continue
+                elif other_client.receive_mode == 'none':
+                    continue
+                elif other_client.receive_mode == 'no_echo' and other_socket == socket:
+                    continue
+                # unspecified receive_mode is considered 'all'
 
-        for socket, client in clients.items():
-            logger.debug('Sending {0} to {1}'.format(obj, client))
-            clients[socket] = client \
-                .with_send_buffer(client.send_buffer + bts)
-    return clients
+                should_send = routing_decision(obj.metadata, other_client.subscriptions)
+                if should_send is True:
+                    result_clients[other_socket] = other_client.with_send_buffer(
+                        other_client.send_buffer + obj.serialize())
+
+    result_clients[socket] = client
+    return result_clients
+
+def handle_objects(clients, socket_tuples):
+    result_clients = dict(clients)
+    for socket_tuple in socket_tuples:
+        result_clients = handle_object(clients, socket_tuple)
+    return result_clients
 
 def main():
     # Set up logging
@@ -338,13 +371,9 @@ def main():
 
         # logger.debug(repr([reading_sockets, writing_sockets]))
 
-        incoming_objects, current_clients = handle_reading_sockets(current_clients, reading_sockets)
+        objects, current_clients = handle_reading_sockets(current_clients, reading_sockets)
         current_clients = without_disconnected(with_closed_sockets(current_clients))
-
-        multiplexable_objects, response_events, current_clients = handle_events(incoming_objects, current_clients)
-
-        current_clients = multiplex(current_clients, multiplexable_objects)
-
+        current_clients = handle_objects(current_clients, objects)
         current_clients = handle_writing_sockets(current_clients, writing_sockets)
         current_clients = without_disconnected(with_closed_sockets(current_clients))
 
