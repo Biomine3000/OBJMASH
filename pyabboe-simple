@@ -8,6 +8,8 @@ import logging
 import sys
 import collections
 
+NUL = '\x00'.encode('utf-8')
+
 METADATA_MAX_SIZE = 2048
 PAYLOAD_MAX_SIZE = 10485760 # 10 megabytes
 SELECT_TIMEOUT = 10
@@ -182,11 +184,18 @@ def handle_subscription_event(socket, client, metadata):
     return client \
         .with_subscriptions(subscriptions) \
         .with_receive_mode(receive_mode) \
-        .with_send_buffer(client.send_buffer + json.dumps(response_metadata).encode('utf-8') + '\\0'.encode('utf-8'))
+        .with_send_buffer(client.send_buffer + json.dumps(response_metadata).encode('utf-8') + NUL)
 
 def handle_ping_event(socket, client, metadata):
-    return client \
-        .with_send_buffer(client.send_buffer + json.dumps({'event': 'pong'}))
+    if client.subscriptions is not None:
+        response_metadata = {'event': 'pong'}
+        if 'id' in metadata:
+            response_metadata['in-reply-to'] = metadata['id']
+
+        return client \
+            .with_send_buffer(client.send_buffer + json.dumps(response_metadata).encode('utf-8') + NUL)
+    else:
+        return client
 
 def handle_events(objects, clients):
     logger = lg()
@@ -220,9 +229,9 @@ def multiplex(clients, objects):
     for obj in objects:
         _, metadata, payload = obj
         if metadata.get('size', 0) == 0:
-            bts = json.dumps(metadata).encode('utf-8') + '\\0'.encode('utf-8')
+            bts = json.dumps(metadata).encode('utf-8') + NUL
         else:
-            bts = json.dumps(metadata).encode('utf-8') + '\\0'.encode('utf-8') + payload
+            bts = json.dumps(metadata).encode('utf-8') + NUL + payload
 
         for socket, client in clients.items():
             logger.debug('Sending {0} to {1}'.format(obj, client))
@@ -233,7 +242,7 @@ def multiplex(clients, objects):
 def main():
     # Set up logging
     logging.basicConfig(level=logging.DEBUG)
-    logger = lg('select')
+    # logger = lg('select')
 
     # Open listening socket
     listening_socket = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
@@ -246,7 +255,7 @@ def main():
     initial_clients = {}
     current_clients = initial_clients
     while True:
-        logger.debug(repr([reading_sockets, writing_sockets]))
+        # logger.debug(repr([reading_sockets, writing_sockets]))
 
         try:
             (reading_sockets,
@@ -257,8 +266,13 @@ def main():
                 client_socket.close()
             listening_socket.close()
             raise kbi
+        except Exception as e:
+            for client_socket in current_clients:
+                client_socket.close()
+            listening_socket.close()
+            raise e
 
-        logger.debug(repr([reading_sockets, writing_sockets]))
+        # logger.debug(repr([reading_sockets, writing_sockets]))
 
         incoming_objects, current_clients = handle_reading_sockets(current_clients, reading_sockets)
         current_clients = without_disconnected(with_closed_sockets(current_clients))
@@ -279,7 +293,7 @@ def main():
             if len(client.send_buffer) > 0:
                 writing_sockets.append(client_socket)
 
-        logger.debug('----')
+        # logger.debug('----')
 
 if __name__ == '__main__':
     main()
