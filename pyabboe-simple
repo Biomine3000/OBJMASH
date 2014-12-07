@@ -7,11 +7,13 @@ import json
 import logging
 import sys
 import collections
+import traceback
 
 NUL = '\x00'.encode('utf-8')
 
 METADATA_MAX_SIZE = 2048
 PAYLOAD_MAX_SIZE = 10485760 # 10 megabytes
+MAX_OBJECT_SIZE = METADATA_MAX_SIZE + 1 + PAYLOAD_MAX_SIZE
 SELECT_TIMEOUT = 10
 
 # Data structures and helpers
@@ -82,7 +84,7 @@ def handle_reading_sockets(clients, sockets):
                 incoming_objects, client = handle_read(socket, client)
                 clients[socket] = client
             except Exception as e:
-                logger.warning("handle_read, client {0}: {1}".format(client, e))
+                logger.warning("handle_read, client {0}: {1}".format(client, traceback.format_exc()))
                 clients[socket] = client.as_disconnected()
 
     return incoming_objects, clients
@@ -114,59 +116,64 @@ def handle_write(socket, client):
 
 
 def first_nul(buffer):
-    for i in range(len(buffer)):
+    for i in range(min(METADATA_MAX_SIZE, len(buffer))):
         if buffer[i] == 0:
             return i
 
-def parse_metadata(buffer):
-    nul_index = first_nul(buffer)
-    return (json.loads(buffer[:nul_index].decode('utf-8', 'strict')),
-            buffer[nul_index + 1:])
+def parse_metadata(buffer, first_nul_index):
+    return (json.loads(buffer[0:first_nul_index].decode('utf-8', 'strict')),
+            buffer[first_nul_index + 1:])
+
+def is_metadata_received(client):
+    if len(client.receive_buffer) > 0:
+        first_nul_index = first_nul(client.receive_buffer)
+        if first_nul_index is not None:
+            return True, first_nul_index
+    return False, None
 
 def handle_read(socket, client):
     logger = lg('read')
-    metadata_received = False
-    if len(client.receive_buffer) > 0:
-        if first_nul(client.receive_buffer) is not None:
-            metadata_received = True
 
-    if metadata_received is False:
-        bytes_left = METADATA_MAX_SIZE - len(client.receive_buffer)
-        if bytes_left == 0:
-            logger.warning("No metadata received within the METADATA_MAX_SIZE limit.")
-            return [], client.as_disconnected()
+    received = socket.recv(MAX_OBJECT_SIZE)
+    if len(received) == 0:
+        lg('read').info("Client disconnected.")
+        return [], client.as_disconnected()
 
-        received = socket.recv(bytes_left)
+    client = client.with_receive_buffer(client.receive_buffer + received)
 
-        # On the read list and nothing to read. Signals disconnection.
-        if len(received) == 0:
-            logger.info("Client disconnected.")
-            return [], client.as_disconnected()
-
-        client = client.with_receive_buffer(client.receive_buffer + received)
-        lg('traffic').debug("Received {0} bytes from {1}".format(len(received), client))
-
-    if len(client.receive_buffer) > 0:
-        nul_index = first_nul(client.receive_buffer)
-        if nul_index is not None:
-            metadata_received = True
+    metadata_received, first_nul_index = is_metadata_received(client)
+    if not metadata_received and len(client.receive_buffer) >= METADATA_MAX_SIZE:
+        lg('read').warning("No payload within METADATA_MAX_SIZE.")
+        return [], client.as_disconnected()
 
     if not metadata_received:
         return [], client
 
+    # Pump objects out of the receive buffer
     objects = []
-    while True:
-        metadata, receive_buffer = parse_metadata(client.receive_buffer)
-        client = client.with_receive_buffer(receive_buffer)
-
-        if metadata.get('size', 0) > 0:
-            raise Exception("Cannot handle payloads yet")
-
-        objects.append((socket, metadata, None))
-
-        nul_index = first_nul(client.receive_buffer)
-        if nul_index is None:
+    while len(client.receive_buffer) > 0:
+        metadata_received, first_nul_index = is_metadata_received(client)
+        if not metadata_received:
             break
+
+        metadata, remaining_buffer = parse_metadata(client.receive_buffer, first_nul_index)
+
+        try:
+            payload_length = int(metadata['size'])
+        except:
+            payload_length = None
+
+        if payload_length is None or payload_length == 0:
+            objects.append((socket, metadata, None))
+            client = client.with_receive_buffer(remaining_buffer)
+            continue
+
+        if len(remaining_buffer) < payload_length:
+            break
+
+        payload = remaining_buffer[0:payload_length]
+        objects.append((socket, metadata, payload))
+        client = client.with_receive_buffer(remaining_buffer[payload_length:])
 
     return objects, client
 
@@ -195,7 +202,7 @@ def handle_subscription_event(clients, socket, client, metadata):
         # notification = BusinessObject({ 'event': 'routing/subscribe/notification',
         #                                 'routing-id': client.routing_id }, None)
 
-    return clients
+    return result_clients
 
 def handle_ping_event(socket, client, metadata):
     if client.subscriptions is not None:
@@ -217,6 +224,8 @@ def handle_events(objects, clients):
         if not 'event' in metadata:
             multiplexable_objects.append((client_socket, metadata, payload))
             continue
+
+        logger.debug('Event {0} received from {1}'.format(metadata['event'], clients[client_socket]))
 
         client = clients.get(client_socket, None)
         if client is None:
