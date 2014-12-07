@@ -170,7 +170,8 @@ def handle_read(socket, client):
 
     return objects, client
 
-def handle_subscription_event(socket, client, metadata):
+def handle_subscription_event(clients, socket, client, metadata):
+    result_clients = dict(clients)
     # TODO validate subscriptions / receive-mode?
     subscriptions = metadata.get('subscriptions', ['*'])
     receive_mode = metadata.get('receive-mode', 'all')
@@ -181,10 +182,20 @@ def handle_subscription_event(socket, client, metadata):
     if 'id' in metadata:
         response_metadata['in-reply-to'] = metadata['id']
 
-    return client \
+    client = client \
         .with_subscriptions(subscriptions) \
         .with_receive_mode(receive_mode) \
         .with_send_buffer(client.send_buffer + json.dumps(response_metadata).encode('utf-8') + NUL)
+    result_clients[socket] = client
+
+    for other_socket, other_client in clients.items():
+        if other_socket == socket:
+            continue
+        # TODO: routing/announcement
+        # notification = BusinessObject({ 'event': 'routing/subscribe/notification',
+        #                                 'routing-id': client.routing_id }, None)
+
+    return clients
 
 def handle_ping_event(socket, client, metadata):
     if client.subscriptions is not None:
@@ -198,7 +209,7 @@ def handle_ping_event(socket, client, metadata):
         return client
 
 def handle_events(objects, clients):
-    logger = lg()
+    logger = lg('event')
     multiplexable_objects = []
     response_events = []
     result_clients = dict(clients)
@@ -214,15 +225,59 @@ def handle_events(objects, clients):
         event_type = metadata.get('event', None)
 
         if event_type == 'routing/subscribe':
-            client = handle_subscription_event(client_socket, client, metadata)
+            result_clients = handle_subscription_event(result_clients, client_socket, client, metadata)
             logger.debug('{0} subscribed'.format(client))
-            result_clients[client_socket] = client
-            response_events.append(({'event': 'routing/subscribe/notification'}))
         elif event_type == 'ping':
             client = handle_ping_event(client_socket, client, metadata)
             result_clients[client_socket] = client
 
     return multiplexable_objects, response_events, result_clients
+
+def routing_decision(metadata, rules):
+    def match(matcher, matchable):
+        if matcher is None or matchable is None:
+            return False
+
+        matcher_parts = matcher.split('/')
+        matchable_parts = matchable.split('/')
+
+        for index, matcher_part in enumerate(matcher_parts):
+            if matcher_part == '*':
+                return True
+
+            if index >= len(matchable_parts):
+                return False
+            matchable_part = matchable_parts[index]
+            if matcher_part != matchable_part:
+                return False
+
+        return True
+
+
+    PASS = False # pass written in lowercase is a keyword in Python
+
+    for rule in rules:
+        is_negative_rule = rule.startswith('!')
+        if is_negative_rule:
+            rule = rule[1:]
+
+        if rule.startswith('#'):
+            rule = rule[1:]
+            for nature in metadata.get('natures', []):
+                if match(rule, nature): # nature == rule:
+                    PASS = not is_negative_rule
+                    break
+
+        elif rule.startswith('@'):
+            rule = rule[1:]
+            if metadata.get('event', None) is not None and match(rule, message.event): # message.event == rule:
+                PASS = not is_negative_rule
+
+        elif rule == '*' or match(rule, metadata.get('type', None)):
+            PASS = not is_negative_rule
+
+    return PASS
+
 
 def multiplex(clients, objects):
     logger = lg('multiplex')
