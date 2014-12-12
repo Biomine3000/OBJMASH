@@ -15,7 +15,7 @@ NUL = '\x00'.encode('utf-8')
 METADATA_MAX_SIZE = 2048
 PAYLOAD_MAX_SIZE = 10485760 # 10 megabytes
 MAX_OBJECT_SIZE = METADATA_MAX_SIZE + 1 + PAYLOAD_MAX_SIZE
-SELECT_TIMEOUT = 10
+SELECT_TIMEOUT = 60
 
 # Data structures and helpers
 _ClientBase = collections.namedtuple("Client", ["address", "send_buffer", "receive_buffer",
@@ -78,12 +78,11 @@ class BusinessObject(object):
         if self.content_type is not None:
             self.metadata['type'] = str(self.content_type)
 
-        ret = bytearray(json.dumps(self.metadata).encode('utf-8'))
-        ret += NUL
+        metadata_and_nul = bytes(json.dumps(self.metadata).encode('utf-8') + NUL)
         if self.size > 0:
-            ret.extend(self.payload)
-
-        return ret
+            return metadata_and_nul + self.payload
+        else:
+            return metadata_and_nul
 
 def without_disconnected(clients):
     return {client_socket:clients[client_socket]
@@ -141,7 +140,6 @@ def handle_write(socket, client):
     except socket_module.error as se:
         logger.warning("Received {0} from {1}".format(se, client))
         return client.as_disconnected()
-
     return client.with_send_buffer(client.send_buffer[sent_bytes:])
 
 def parse_metadata(buffer, first_nul_index):
@@ -204,31 +202,49 @@ def handle_read(socket, client):
         objects.append((socket, BusinessObject(metadata, payload)))
         client = client.with_receive_buffer(remaining_buffer[payload_length:])
 
+    # logger.debug('Received {0} objects'.format(len(objects)))
     return objects, client
 
 
-def routing_decision(metadata, rules):
-    def match(matcher, matchable):
-        if matcher is None or matchable is None:
+def match_hierarchy(matcher, matchable):
+    """
+    Matches hierarchies of strings such as foo/bar to each other, considering
+    asterisk as a wildcard that matches any hierarchy component or subtree.
+
+    >>> match_hierarchy('a/b/c', 'a/b/c')
+    True
+    >>> match_hierarchy('a/b/c', 'a/b/c/d')
+    True
+    >>> match_hierarchy('a/b/c/d', 'a/b/c')
+    False
+    >>> match_hierarchy('a/b/*', 'a/b/c')
+    True
+    >>> match_hierarchy('a/b/*', 'a/b/c/d')
+    True
+    >>> match_hierarchy('foo', None)
+    False
+    """
+    if matcher is None or matchable is None:
+        return False
+
+    matcher_parts = matcher.split('/')
+    matchable_parts = matchable.split('/')
+
+    for index, matcher_part in enumerate(matcher_parts):
+        if matcher_part == '*':
+            return True
+
+        if index >= len(matchable_parts):
+            return False
+        matchable_part = matchable_parts[index]
+        if matcher_part != matchable_part:
             return False
 
-        matcher_parts = matcher.split('/')
-        matchable_parts = matchable.split('/')
+    return True
 
-        for index, matcher_part in enumerate(matcher_parts):
-            if matcher_part == '*':
-                return True
-
-            if index >= len(matchable_parts):
-                return False
-            matchable_part = matchable_parts[index]
-            if matcher_part != matchable_part:
-                return False
-
-        return True
-
-
+def routing_decision(metadata, rules):
     PASS = False # pass written in lowercase is a keyword in Python
+    logger = lg('routing-decision')
 
     for rule in rules:
         is_negative_rule = rule.startswith('!')
@@ -238,18 +254,29 @@ def routing_decision(metadata, rules):
         if rule.startswith('#'):
             rule = rule[1:]
             for nature in metadata.get('natures', []):
-                if match(rule, nature): # nature == rule:
+                if match_hierarchy(rule, nature): # nature == rule:
+                    logger.debug('Matches nature {0}, negative: {1}'.format(nature, is_negative_rule))
                     PASS = not is_negative_rule
                     break
 
         elif rule.startswith('@'):
             rule = rule[1:]
             event = metadata.get('event', None)
-            if event is not None and match(rule, event): # message.event == rule:
+            if event is not None and match_hierarchy(rule, event): # message.event == rule:
+                logger.debug('Matches event {0}, negative: {1}'.format(event, is_negative_rule))
                 PASS = not is_negative_rule
 
-        elif rule == '*' or match(rule, metadata.get('type', None)):
-            PASS = not is_negative_rule
+
+        else:
+            type_value = metadata.get('type', None)
+            if isinstance(type_value, str) and ';' in type_value:
+                type_value = type_value.split(';')[0]
+
+            if rule == '*' or match_hierarchy(rule, type_value):
+                logger.debug('Matches type {0}, negative: {1}'.format(type_value, is_negative_rule))
+                PASS = not is_negative_rule
+
+    logger.info('{0}, {1} => {2}'.format(metadata, rules, PASS))
 
     return PASS
 
@@ -305,15 +332,19 @@ def handle_object(clients, socket_tuple):
         if event == 'routing/subscribe':
             result_clients, client = subscribe_client(result_clients, client, socket, obj)
             # TODO: routing announcement
+            result_clients[socket] = client
         else:
             client = client.as_disconnected()
             lg('handle-object').warning(
                 "Unsubscribed client {0} sent something else than a subscription ({1})".format(client, event))
+            result_clients[socket] = client
     else:
         if event == 'ping':
             client = respond_to_ping(client, obj)
+            result_clients[socket] = client
         else:
-            for other_socket, other_client in result_clients.items():
+            for other_socket in result_clients.keys():
+                other_client = result_clients[other_socket]
                 if other_client.receive_mode == 'events_only' and event is None:
                     continue
                 elif other_client.receive_mode == 'none':
@@ -324,26 +355,29 @@ def handle_object(clients, socket_tuple):
 
                 should_send = routing_decision(obj.metadata, other_client.subscriptions)
                 if should_send is True:
-                    result_clients[other_socket] = other_client.with_send_buffer(
-                        other_client.send_buffer + obj.serialize())
-
-    result_clients[socket] = client
+                    other_client = other_client.with_send_buffer(other_client.send_buffer + obj.serialize())
+                    result_clients[other_socket] = other_client
     return result_clients
 
 def handle_objects(clients, socket_tuples):
     result_clients = dict(clients)
     for socket_tuple in socket_tuples:
-        result_clients = handle_object(clients, socket_tuple)
+        result_clients = handle_object(result_clients, socket_tuple)
     return result_clients
 
-def main():
+def run_server(host, port, verbose=False):
     # Set up logging
-    logging.basicConfig(level=logging.DEBUG)
-    # logger = lg('select')
+    if verbose is True:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+        lg('routing-decision').setLevel(logging.WARN)
+        lg('traffic').setLevel(logging.WARN)
+        lg('read').setLevel(logging.WARN)
 
     # Open listening socket
     listening_socket = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
-    listening_socket.bind(("localhost", 7890))
+    listening_socket.bind((host, port))
     listening_socket.listen(5)
 
     reading_sockets = [listening_socket]
@@ -352,7 +386,7 @@ def main():
     initial_clients = {}
     current_clients = initial_clients
     while True:
-        # logger.debug(repr([reading_sockets, writing_sockets]))
+        # lg('select').debug(repr((len(reading_sockets), len(writing_sockets))))
 
         try:
             (reading_sockets,
@@ -369,8 +403,6 @@ def main():
             listening_socket.close()
             raise e
 
-        # logger.debug(repr([reading_sockets, writing_sockets]))
-
         objects, current_clients = handle_reading_sockets(current_clients, reading_sockets)
         current_clients = without_disconnected(with_closed_sockets(current_clients))
         current_clients = handle_objects(current_clients, objects)
@@ -381,12 +413,17 @@ def main():
         reading_sockets = [listening_socket]
         writing_sockets = []
         for client_socket, client in current_clients.items():
+            if client.disconnected:
+                continue
+
             reading_sockets.append(client_socket)
 
             if len(client.send_buffer) > 0:
                 writing_sockets.append(client_socket)
 
-        # logger.debug('----')
-
 if __name__ == '__main__':
-    main()
+    if len(sys.argv) == 2 and sys.argv[1] == 'test':
+        import doctest
+        doctest.testmod()
+    else:
+        run_server("localhost", 7890)
