@@ -128,6 +128,8 @@ def handle_reading_sockets(clients, sockets):
 def handle_writing_sockets(clients, sockets):
     logger = lg('write')
     for socket in sockets:
+        if socket not in clients:
+            continue
         client = clients[socket]
         try:
             client = handle_write(socket, client)
@@ -365,6 +367,8 @@ def handle_object(clients, socket_tuple, server_routing_id):
                     if 'route' not in obj.metadata:
                         obj.metadata['route'] = [client.routing_id]
                     obj.metadata['route'].append(server_routing_id)
+                    if other_client.routing_id in obj.metadata['route'][1:]:
+                        continue # cut cycle
 
                     other_client = other_client.with_send_buffer(other_client.send_buffer + obj.serialize())
                     result_clients[other_socket] = other_client
