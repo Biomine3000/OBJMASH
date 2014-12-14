@@ -21,8 +21,7 @@ SELECT_TIMEOUT = 60
 
 # Data structures and helpers
 _ClientBase = collections.namedtuple("Client", ["address", "send_buffer", "receive_buffer",
-                                                "disconnected", "subscriptions", "receive_mode",
-                                                "routing_id"])
+                                                "disconnected", "subscriptions", "routing_id"])
 
 logger_basename = sys.argv[0].strip('.').strip('/')
 def lg(name=None):
@@ -43,8 +42,7 @@ class Client(_ClientBase):
 
     def from_address(address):
         return Client(address=address, send_buffer=bytes(), receive_buffer=bytes(),
-                      disconnected=False, subscriptions=None, receive_mode=None,
-                      routing_id=hex_from_address(address))
+                      disconnected=False, subscriptions=None, routing_id=hex_from_address(address))
 
     def with_send_buffer(self, buffer):
         return Client(**self._attr_substituted('send_buffer', buffer))
@@ -54,9 +52,6 @@ class Client(_ClientBase):
 
     def with_subscriptions(self, subscriptions):
         return Client(**self._attr_substituted('subscriptions', subscriptions))
-
-    def with_receive_mode(self, receive_mode):
-        return Client(**self._attr_substituted('receive_mode', receive_mode))
 
     def as_disconnected(self):
         return Client(**self._attr_substituted('disconnected', True))
@@ -251,7 +246,7 @@ def match_hierarchy(matcher, matchable):
 
     return True
 
-def routing_decision(metadata, rules):
+def routing_decision(metadata, rules, recipient_routing_id):
     PASS = False # pass written in lowercase is a keyword in Python
     logger = lg('routing-decision')
 
@@ -275,6 +270,17 @@ def routing_decision(metadata, rules):
                 logger.debug('Matches event {0}, negative: {1}'.format(event, is_negative_rule))
                 PASS = not is_negative_rule
 
+        elif rule.startswith('?'):
+            rule = rule[1:]
+            route = metadata.get('route', [])
+            if len(route) == 0:
+                first_on_route = None
+            else:
+                first_on_route = route[0]
+            if rule == '*' or rule == first_on_route or \
+               (rule == 'self' and first_on_route == recipient_routing_id):
+                logger.debug('Matches recipient {0}, negative: {1}'.format(rule, is_negative_rule))
+                PASS = not is_negative_rule
 
         else:
             type_value = metadata.get('type', None)
@@ -290,40 +296,36 @@ def routing_decision(metadata, rules):
     return PASS
 
 def subscribe_client(clients, client, socket, subscription):
+    result_objects = []
     subscriptions = subscription.metadata.get('subscriptions', ['*'])
-    receive_mode = subscription.metadata.get('receive-mode', 'all')
 
     metadata = {'event': 'routing/subscribe/reply',
                          'subscriptions': subscriptions,
-                         'receive-mode': receive_mode,
-                         'routing-id': client.routing_id}
+                         'routing-id': client.routing_id,
+                'to': client.routing_id}
 
     if 'id' in subscription.metadata:
         metadata['in-reply-to'] = subscription.metadata['id']
+    result_objects.append(BusinessObject(metadata, None))
 
-    client = client \
-        .with_subscriptions(subscriptions) \
-        .with_receive_mode(receive_mode) \
-        .with_send_buffer(BusinessObject(metadata, None).serialize())
+    client = client.with_subscriptions(subscriptions)
     result_clients = dict(clients)
     result_clients[socket] = client
 
     lg('subscribe-client').info("{0} subscribed".format(client))
 
-    notification_object = BusinessObject(
-        {'event': 'routing/subscribe/notification',
-         'routing-id': client.routing_id},
-        None)
+    notification_metadata = {'event': 'routing/subscribe/notification',
+                             'routing-id': client.routing_id}
     for other_socket, other_client in clients.items():
         if other_socket == socket:
             continue
-        if other_client.receive_mode == 'none':
-            continue
 
-        result_clients[other_socket] = other_client \
-            .with_send_buffer(client.send_buffer + notification_object.serialize())
+        metadata = dict(notification_metadata)
+        metadata['to'] = other_client.routing_id
+        # TODO: do we want to target notifications to neighbors with to-field?
+        result_objects.append(BusinessObject(metadata, None))
 
-    return result_clients, client
+    return result_objects, result_clients, client
 
 def respond_to_ping(client, ping):
     metadata = {'event': 'pong'}
@@ -331,16 +333,17 @@ def respond_to_ping(client, ping):
         metadata['in-reply-to'] = ping.metadata['id']
     return client.with_send_buffer(client.send_buffer + BusinessObject(metadata, None).serialize())
 
-def handle_object(clients, socket_tuple, server_routing_id):
+def handle_incoming_object(clients, socket_tuple, server_routing_id):
     socket, obj = socket_tuple
     client = clients[socket]
+    result_objects = []
     result_clients = dict(clients)
-    event = obj.metadata.get('event', None)
 
     if client.subscriptions is None:
+        event = obj.metadata.get('event', None)
         if event == 'routing/subscribe':
-            result_clients, client = subscribe_client(result_clients, client, socket, obj)
-            # TODO: routing announcement
+            objects, result_clients, client = subscribe_client(result_clients, client, socket, obj)
+            result_objects += objects
             result_clients[socket] = client
         else:
             client = client.as_disconnected()
@@ -348,21 +351,20 @@ def handle_object(clients, socket_tuple, server_routing_id):
                 "Unsubscribed client {0} sent something else than a subscription ({1})".format(client, event))
             result_clients[socket] = client
     else:
+        event = obj.metadata.get('event', None)
         if event == 'ping':
+            # TODO: should this be handled in a uniform way?
             client = respond_to_ping(client, obj)
             result_clients[socket] = client
         else:
             for other_socket in result_clients.keys():
                 other_client = result_clients[other_socket]
-                if other_client.receive_mode == 'events_only' and event is None:
-                    continue
-                elif other_client.receive_mode == 'none':
-                    continue
-                elif other_client.receive_mode == 'no_echo' and other_socket == socket:
-                    continue
-                # unspecified receive_mode is considered 'all'
 
-                should_send = routing_decision(obj.metadata, other_client.subscriptions)
+                if 'to' in obj.metadata and other_client.routing_id != obj.metadata['to']:
+                    continue
+
+                should_send = routing_decision(obj.metadata, other_client.subscriptions,
+                                               other_client.routing_id)
                 if should_send is True:
                     if 'route' not in obj.metadata:
                         obj.metadata['route'] = [client.routing_id]
@@ -372,12 +374,48 @@ def handle_object(clients, socket_tuple, server_routing_id):
 
                     other_client = other_client.with_send_buffer(other_client.send_buffer + obj.serialize())
                     result_clients[other_socket] = other_client
+
+    return result_objects, result_clients
+
+def handle_incoming_objects(clients, socket_tuples, server_routing_id):
+    result_clients = dict(clients)
+    result_objects = []
+    for socket_tuple in socket_tuples:
+        objects, result_clients = handle_incoming_object(result_clients, socket_tuple, server_routing_id)
+        result_objects += objects
+    return result_objects, result_clients
+
+def handle_outgoing_object(clients, obj):
+    result_clients = dict(clients)
+
+    def get_by_routing_id(routing_id):
+        for s, c in result_clients.items():
+            if c.routing_id == routing_id:
+                return s, c
+
+    if 'to' in obj.metadata:
+        socket, client = get_by_routing_id(obj.metadata['to'])
+
+        should_send = routing_decision(obj.metadata, client.subscriptions, client.routing_id)
+        if should_send:
+            client = client.with_send_buffer(client.send_buffer + obj.serialize())
+            result_clients[socket] = client
+    else:
+        for socket, client in result_clients.items():
+            should_send = routing_decision(obj.metadata, client.subscriptions, client.routing_id)
+
+            if should_send:
+                client = client.with_send_buffer(client.send_buffer + obj.serialize())
+                result_clients[socket] = client
+
     return result_clients
 
-def handle_objects(clients, socket_tuples, server_routing_id):
+def handle_outgoing_objects(clients, objects):
     result_clients = dict(clients)
-    for socket_tuple in socket_tuples:
-        result_clients = handle_object(result_clients, socket_tuple, server_routing_id)
+    for obj in objects:
+        clients = handle_outgoing_object(result_clients, obj)
+        for k, v in clients.items():
+            result_clients[k] = v
     return result_clients
 
 def run_server(host, port, verbose=False):
@@ -422,7 +460,8 @@ def run_server(host, port, verbose=False):
 
         objects, current_clients = handle_reading_sockets(current_clients, reading_sockets)
         current_clients = without_disconnected(with_closed_sockets(current_clients))
-        current_clients = handle_objects(current_clients, objects, server_routing_id)
+        objects, current_clients = handle_incoming_objects(current_clients, objects, server_routing_id)
+        current_clients = handle_outgoing_objects(current_clients, objects)
         current_clients = handle_writing_sockets(current_clients, writing_sockets)
         current_clients = without_disconnected(with_closed_sockets(current_clients))
 
