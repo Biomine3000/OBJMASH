@@ -8,20 +8,18 @@ import logging
 import sys
 import collections
 import traceback
-import email.utils
-import binascii
-import uuid
 
-NUL = '\x00'.encode('utf-8')
+from obj_mash import METADATA_MAX_SIZE, MAX_OBJECT_SIZE, NUL
+from obj_mash import BusinessObject, hex_from_address
+from obj_mash import host_routing_id, is_metadata_received, parse_metadata
 
-METADATA_MAX_SIZE = 2048
-PAYLOAD_MAX_SIZE = 10485760 # 10 megabytes
-MAX_OBJECT_SIZE = METADATA_MAX_SIZE + 1 + PAYLOAD_MAX_SIZE
+
 SELECT_TIMEOUT = 60
 
 # Data structures and helpers
-_ClientBase = collections.namedtuple("Client", ["address", "send_buffer", "receive_buffer",
-                                                "disconnected", "subscriptions", "routing_id"])
+_client_fields = ["address", "send_buffer", "receive_buffer", "disconnected",
+                  "subscriptions", "routing_id"]
+_ClientBase = collections.namedtuple("Client", _client_fields)
 
 logger_basename = sys.argv[0].strip('.').strip('/')
 def lg(name=None):
@@ -30,13 +28,15 @@ def lg(name=None):
     else:
         return logging.getLogger(logger_basename + "." + name)
 
-def hex_from_address(address):
-    return binascii.hexlify("{0}-{1}".format(*address).encode('utf-8')).decode('utf-8')
-
 class Client(_ClientBase):
     def _attr_substituted(self, attr_name, value):
-        # attrs = vars(self)
-        attrs = self._asdict()
+        """
+        Implementation is a bit ugly as vars(self) and self._asdict() seem to
+        not work like they should on for example Python 3.4 on Mac.
+        """
+        attrs = {}
+        for field in _client_fields:
+            attrs[field] = getattr(self, field)
         attrs[attr_name] = value
         return attrs
 
@@ -56,37 +56,9 @@ class Client(_ClientBase):
     def as_disconnected(self):
         return Client(**self._attr_substituted('disconnected', True))
 
-class BusinessObject(object):
-    def __init__(self, metadata_dict, payload):
-        self.metadata = metadata_dict
-        self.id = metadata_dict.get('id', email.utils.make_msgid())
-        self.payload = payload
-        self.size = metadata_dict.get('size', 0)
-        self.content_type = metadata_dict.get('type', None)
-        self.event = metadata_dict.get('event', None)
-
-    def __str__(self):
-        return "<{0} {1}>".format(self.__class__.__name__, self.content_type)
-
-    def __hash__(self):
-        return self.id.__hash__()
-
-    def __eq__(self, other):
-        return self.__hash__() == other.__hash__()
-
-    def serialize(self):
-        self.metadata['id'] = self.id
-        self.metadata['size'] = self.size
-        if self.content_type is not None:
-            self.metadata['type'] = str(self.content_type)
-
-        metadata_and_nul = bytes(json.dumps(self.metadata).encode('utf-8') + NUL)
-        if self.size > 0:
-            return metadata_and_nul + self.payload
-        else:
-            return metadata_and_nul
 
 def without_disconnected(clients):
+    # TODO: send routing/disconnect so client registry can function
     return {client_socket:clients[client_socket]
             for client_socket in clients
             if not clients[client_socket].disconnected}
@@ -95,7 +67,7 @@ def with_closed_sockets(clients):
     logger = lg()
     for socket, client in clients.items():
         if client.disconnected:
-            logger.warn("Disconnecting {0}".format(client))
+            logger.info("Disconnecting {0}".format(client))
             socket.close()
     return clients
 
@@ -146,22 +118,6 @@ def handle_write(socket, client):
         return client.as_disconnected()
     return client.with_send_buffer(client.send_buffer[sent_bytes:])
 
-def parse_metadata(buffer, first_nul_index):
-    return (json.loads(buffer[0:first_nul_index].decode('utf-8', 'strict')),
-            buffer[first_nul_index + 1:])
-
-def is_metadata_received(client):
-    def first_nul(buffer):
-        for i in range(min(METADATA_MAX_SIZE, len(buffer))):
-            if buffer[i] == 0:
-                return i
-
-    if len(client.receive_buffer) > 0:
-        first_nul_index = first_nul(client.receive_buffer)
-        if first_nul_index is not None:
-            return True, first_nul_index
-    return False, None
-
 def handle_read(socket, client):
     logger = lg('read')
 
@@ -172,9 +128,9 @@ def handle_read(socket, client):
 
     client = client.with_receive_buffer(client.receive_buffer + received)
 
-    metadata_received, first_nul_index = is_metadata_received(client)
+    metadata_received, first_nul_index = is_metadata_received(client.receive_buffer)
     if not metadata_received and len(client.receive_buffer) >= METADATA_MAX_SIZE:
-        lg('read').warning("No payload within METADATA_MAX_SIZE.")
+        logger.warning("No payload within METADATA_MAX_SIZE.")
         return [], client.as_disconnected()
 
     if not metadata_received:
@@ -183,7 +139,7 @@ def handle_read(socket, client):
     # Pump objects out of the receive buffer
     objects = []
     while len(client.receive_buffer) > 0:
-        metadata_received, first_nul_index = is_metadata_received(client)
+        metadata_received, first_nul_index = is_metadata_received(client.receive_buffer)
         if not metadata_received:
             break
 
@@ -428,7 +384,7 @@ def run_server(host, port, verbose=False):
         lg('traffic').setLevel(logging.WARN)
         lg('read').setLevel(logging.WARN)
 
-    server_routing_id = binascii.hexlify(str(uuid.getnode()).encode('utf-8')).decode('utf-8')
+    server_routing_id = host_routing_id()
 
     # Open listening socket
     listening_socket = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
