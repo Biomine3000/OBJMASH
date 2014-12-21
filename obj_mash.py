@@ -137,6 +137,8 @@ def reply_for_object(obj, socket, timeout_secs=1.0):
             took = dt_now() - started
             return reply, took.total_seconds()
 
+class InvalidObject(Exception): pass
+
 class BusinessObject(object):
     def __init__(self, metadata_dict, payload):
         self.metadata = metadata_dict

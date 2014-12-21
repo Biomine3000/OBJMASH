@@ -78,7 +78,7 @@ def without_disconnected(clients):
     return result_objects, result_clients
 
 def with_closed_sockets(clients):
-    logger = lg()
+    logger = lg('close-socket')
     for socket, client in clients.items():
         if client.disconnected:
             logger.info("Disconnecting {0}".format(client))
@@ -89,6 +89,7 @@ def with_closed_sockets(clients):
 def handle_reading_sockets(clients, sockets):
     logger = lg('read')
     incoming_objects = []
+
     for socket in sockets:
         if socket not in clients:
             client_socket, address = socket.accept()
@@ -98,10 +99,11 @@ def handle_reading_sockets(clients, sockets):
         else:
             client = clients[socket]
             try:
-                incoming_objects, client = handle_read(socket, client)
+                i_objs, client = handle_read(socket, client)
+                incoming_objects.extend(i_objs)
                 clients[socket] = client
             except Exception as e:
-                logger.warning("handle_read, client {0}: {1}".format(client, traceback.format_exc()))
+                logger.warning("{0}: {1}".format(client, traceback.format_exc()))
                 clients[socket] = client.as_disconnected()
 
     return incoming_objects, clients
@@ -298,10 +300,10 @@ def subscribe_client(clients, client, socket, subscription):
     return result_objects, result_clients, client
 
 def respond_to_ping(client, ping):
-    metadata = {'event': 'pong'}
+    metadata = {'event': 'pong', 'to': client.routing_id}
     if 'id' in ping.metadata:
         metadata['in-reply-to'] = ping.metadata['id']
-    return client.with_send_buffer(client.send_buffer + BusinessObject(metadata, None).serialize())
+    return BusinessObject(metadata, None)
 
 def handle_incoming_object(clients, socket_tuple, server_routing_id):
     socket, obj = socket_tuple
@@ -323,9 +325,8 @@ def handle_incoming_object(clients, socket_tuple, server_routing_id):
     else:
         event = obj.metadata.get('event', None)
         if event == 'ping':
-            # TODO: should this be handled in a uniform way?
-            client = respond_to_ping(client, obj)
-            result_clients[socket] = client
+            pong_object = respond_to_ping(client, obj)
+            result_objects.append(pong_object)
         else:
             for other_socket in result_clients.keys():
                 other_client = result_clients[other_socket]
@@ -333,8 +334,12 @@ def handle_incoming_object(clients, socket_tuple, server_routing_id):
                 if 'to' in obj.metadata and other_client.routing_id != obj.metadata['to']:
                     continue
 
+                if other_client.subscriptions is None:
+                    continue # other client not subscribed
+
                 should_send = routing_decision(obj.metadata, other_client.subscriptions,
                                                other_client.routing_id)
+
                 if should_send is True:
                     if 'route' not in obj.metadata:
                         obj.metadata['route'] = [client.routing_id]
@@ -366,7 +371,11 @@ def handle_outgoing_object(clients, obj):
     if 'to' in obj.metadata:
         socket, client = get_by_routing_id(obj.metadata['to'])
 
-        should_send = routing_decision(obj.metadata, client.subscriptions, client.routing_id)
+        if client.subscriptions is None:
+            should_send = False # client not subscribed
+        else:
+            should_send = routing_decision(obj.metadata, client.subscriptions, client.routing_id)
+
         if should_send:
             client = client.with_send_buffer(client.send_buffer + obj.serialize())
             result_clients[socket] = client
@@ -388,7 +397,7 @@ def handle_outgoing_objects(clients, objects):
             result_clients[k] = v
     return result_clients
 
-def run_server(host, port, verbose=False):
+def run_server(host, port, verbose=False, socket_backlog=100):
     # Set up logging
     if verbose is True:
         logging.basicConfig(level=logging.DEBUG)
@@ -397,13 +406,16 @@ def run_server(host, port, verbose=False):
         lg('routing-decision').setLevel(logging.WARN)
         lg('traffic').setLevel(logging.WARN)
         lg('read').setLevel(logging.WARN)
+        # lg('subscribe-client').setLevel(logging.WARN)
+        # lg('close-socket').setLevel(logging.WARN)
 
     server_routing_id = host_routing_id()
 
     # Open listening socket
     listening_socket = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
+    listening_socket.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
     listening_socket.bind((host, port))
-    listening_socket.listen(5)
+    listening_socket.listen(socket_backlog)
 
     reading_sockets = [listening_socket]
     writing_sockets = []
