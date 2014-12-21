@@ -1,0 +1,262 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+from __future__ import with_statement, print_function
+
+import socket
+import select
+import json
+
+from time import sleep
+from argparse import ArgumentParser
+from sys import stdout, stderr
+from codecs import getwriter
+from datetime import datetime, timedelta
+from threading import Thread
+from sys import stderr
+
+from obj_mash import BusinessObject, InvalidObject, read_object
+
+u8 = getwriter('utf-8')(stdout)
+e8 = getwriter('utf-8')(stderr)
+
+
+def median(l):
+    sorts = sorted(l)
+    length = len(sorts)
+    if not length % 2:
+        return (sorts[length / 2] + sorts[length / 2 - 1]) / 2.0
+    return sorts[length / 2]
+
+
+def serial_connector(host, port, times):
+    """
+    Connects, subscribes, waits for a reply, disconnects.  Prints out time
+    taken.
+    """
+    iterations = 0
+    times_taken = []
+    while iterations < times:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((host, port))
+
+        metadata = {
+            'event': 'routing/subscribe',
+            'subscriptions': ['*']
+            }
+        reg = BusinessObject(metadata, None)
+        reg.serialize(socket=sock)
+
+        started = datetime.now()
+
+        while True:
+            rlist, wlist, xlist = select.select([sock], [], [], 1)
+
+            if datetime.now() - timedelta(seconds=3) > started:
+                break
+            elif len(rlist) > 0:
+                resp = read_object(sock, last_activity_timeout_secs=60)
+
+
+                if resp is None:
+                    break
+                elif resp.event == 'routing/subscribe/reply':
+                    time_taken = datetime.now() - started
+                    times_taken.append(time_taken.total_seconds())
+                    stderr.write(".")
+                    stderr.flush()
+                    break
+                else:
+                    break
+
+        sock.close()
+        iterations += 1
+    print()
+    return median(times_taken)
+
+
+class ParallelClient(Thread):
+    def __init__(self, host, port, number, deadline):
+        Thread.__init__(self)
+        self.host = host
+        self.port = port
+        self.number = number
+        self.deadline = deadline
+
+        self.subscribed = False
+        self.received_pong = False
+        self.pongs_received = 0
+
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((self.host, self.port))
+
+        reg = BusinessObject({'event': 'routing/subscribe',
+                              'subscriptions': ['@routing/subscribe/reply', "@pong"]}, None)
+        reg.serialize(socket=sock)
+        started = datetime.now()
+
+        while True:
+            rlist, wlist, xlist = select.select([sock], [], [], 0.1)
+        
+            if datetime.now() > self.deadline:
+                break
+
+            elif len(rlist) > 0:
+                resp = read_object(sock, last_activity_timeout_secs=60)
+
+                if resp is None:
+                    break
+                elif resp.event == 'routing/subscribe/reply':
+                    self.subscribed = True
+                    stderr.write("S")
+                    stderr.flush()
+                elif resp.event == 'pong':
+                    self.received_pong = True
+                    self.pongs_received = self.pongs_received + 1
+                    stderr.write("O")
+                    stderr.flush()
+                else:
+                    pass
+            elif len(rlist) == 0:
+                stderr.write("I")
+                stderr.flush()
+                BusinessObject({'event': 'ping'}, None).serialize(socket=sock)
+                sleep(5)
+
+        sock.close()
+        stderr.write("E")
+        stderr.flush()
+
+
+def parallel_connector(host, port, clients, timeout):
+    threads = []
+
+    deadline = datetime.now() + timedelta(seconds=timeout)
+    for i in xrange(clients):
+        threads.append(ParallelClient(host, port, i, deadline))
+
+    for i in xrange(clients):
+        threads[i].start()
+
+    while datetime.now() < deadline:
+        sleep(1)
+
+    for i in xrange(clients):
+        threads[i].join()
+
+    clients_subscribed = 0
+    clients_ponged = 0
+    for i in xrange(clients):
+        if threads[i].subscribed is True:
+            clients_subscribed += 1
+        if threads[i].received_pong is True:
+            clients_ponged += 1
+
+    print()
+    print("Clients subscribed: %i" % clients_subscribed)
+    print("Clients received pongs %i" % clients_ponged)
+
+
+def partial_metadata_sender(host, port):
+    """
+    Sends just something that can't be interpreted and hangs.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((host, port))
+    sock.send("-")
+    print("partial_metadata_sender: sent -")
+
+
+def partial_payload_sender(host, port):
+    """
+    Sends only part of the payload and then stays hanging.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((host, port))
+
+    content = u"content"
+    payload = bytearray(content, encoding='utf-8')
+    metadata = {
+        'event': 'routing/subscribe',
+        'size': len(payload),
+        'subscriptions': ['*'],
+        'type': 'text/plain; charset=UTF-8'
+    }
+    reg = BusinessObject(metadata, payload)
+
+    buffer = bytearray(json.dumps(metadata, ensure_ascii=False), encoding='utf-8')
+    buffer += '\x00'
+    buffer += payload[0:-2]
+    sock.send(buffer)
+
+    started = datetime.now()
+
+    while True:
+        rlist, wlist, xlist = select.select([sock], [], [], 1)
+
+        if datetime.now() - timedelta(seconds=3) > started:
+            break
+        elif len(rlist) > 0:
+            resp = read_object(sock, last_activity_timeout_secs=60)
+
+            time_taken = datetime.now() - started
+            print(u"{:+f} ms".format(time_taken.total_seconds() * 1000))
+
+            if resp is None:
+                break
+            elif resp.event == 'routing/subscribe/reply':
+                break
+            else:
+                break
+
+    sock.close()
+
+
+def massive_metadata(host, port):
+    """
+    Just sends bunch of stuff.  Never a null.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((host, port))
+
+    started = datetime.now()
+    buffer_1k = ''.join(["i" for i in xrange(1024)])
+
+    iterations = 1000000
+    while iterations > 0:
+        sock.send(buffer_1k)
+        if datetime.now() - timedelta(seconds=300) > started:
+            break
+        iterations -= 1
+
+    sock.close()
+
+
+def main():
+    parser = ArgumentParser(description='Make object system service calls')
+    parser.add_argument("--host", dest="host", default="localhost")
+    parser.add_argument("--port", dest="port", default=7890, type=int)
+    parser.add_argument("--serial-times", dest="serial_times", default=1000, type=int)
+    parser.add_argument("--parallel-clients", dest="parallel_clients", default=100, type=int)
+    parser.add_argument("--parallel-timeout", dest="parallel_timeout", default=30, type=int)
+    opts = parser.parse_args()
+
+    parallel_connector(opts.host, opts.port, opts.parallel_clients, opts.parallel_timeout)
+    partial_metadata_sender(opts.host, opts.port)
+    partial_payload_sender(opts.host, opts.port)
+    
+    print("Median connection time (serial connector): %s" %
+          str(serial_connector(opts.host, opts.port, opts.serial_times)))
+
+
+    try:
+        massive_metadata(opts.host, opts.port)
+    except socket.error, e:
+        print("Received socket error like expected; massive_metadata: %s" % e)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt, ke:
+        print("Exiting.")
