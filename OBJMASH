@@ -58,10 +58,24 @@ class Client(_ClientBase):
 
 
 def without_disconnected(clients):
-    # TODO: send routing/disconnect so client registry can function
-    return {client_socket:clients[client_socket]
-            for client_socket in clients
-            if not clients[client_socket].disconnected}
+    disconnected_routing_ids = []
+    result_objects, result_clients = [], {}
+
+    for socket, client in clients.items():
+        if client.disconnected is not False:
+            disconnected_routing_ids.append(client.routing_id)
+        else:
+            result_clients[socket] = client
+
+    for routing_id in disconnected_routing_ids:
+        for socket, client in result_clients.items():
+            result_objects.append(BusinessObject({
+                'event': 'routing/disconnect',
+                'routing-id': routing_id,
+                'to': client.routing_id
+                }, None))
+
+    return result_objects, result_clients
 
 def with_closed_sockets(clients):
     logger = lg()
@@ -414,12 +428,14 @@ def run_server(host, port, verbose=False):
             listening_socket.close()
             raise e
 
-        objects, current_clients = handle_reading_sockets(current_clients, reading_sockets)
-        current_clients = without_disconnected(with_closed_sockets(current_clients))
-        objects, current_clients = handle_incoming_objects(current_clients, objects, server_routing_id)
-        current_clients = handle_outgoing_objects(current_clients, objects)
+        disco_objs1, current_clients = without_disconnected(with_closed_sockets(current_clients))
+        i_objs, current_clients = handle_reading_sockets(current_clients, reading_sockets)
+        disco_objs2, current_clients = without_disconnected(with_closed_sockets(current_clients))
+        o_objs, current_clients = handle_incoming_objects(current_clients, i_objs, server_routing_id)
+        o_objs.extend(disco_objs1)
+        o_objs.extend(disco_objs2)
+        current_clients = handle_outgoing_objects(current_clients, o_objs)
         current_clients = handle_writing_sockets(current_clients, writing_sockets)
-        current_clients = without_disconnected(with_closed_sockets(current_clients))
 
         # Sockets for next round
         reading_sockets = [listening_socket]
