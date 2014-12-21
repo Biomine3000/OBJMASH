@@ -30,16 +30,16 @@ def should_reply_with_correct_object(routing_id, request, reply):
     payload_text = reply.payload.decode('utf-8')
     payload = json.loads(payload_text)
 
-    if 'clients' not in payload:
-        raise Exception("attribute 'clients' not in payload")
+    if not isinstance(payload, dict):
+        raise Exception("payload is not a dict")
 
     d = None
-    for dct in payload['clients']:
-        if 'routing-id' not in dct:
-            raise Exception("attribute 'routing-id' not in list item in clients list")
-        if dct['routing-id'] == routing_id:
-                d = dct
-                break
+    for k, v in payload.iteritems():
+        if 'routing-id' not in v:
+            raise Exception("attribute 'routing-id' not in client value in client dict")
+        if v['routing-id'] == routing_id:
+            d = v
+            break
 
     if d is None:
         raise Exception('Client not present in returned client listing')

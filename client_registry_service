@@ -1,0 +1,111 @@
+# -*- coding: utf-8 -*-
+import sys; assert sys.version > '3'
+import socket as socket_module
+import logging
+import select
+import time
+import traceback
+import datetime
+import json
+
+from obj_mash import BusinessObject, InvalidObject, read_object, dt_now, reply_for_object
+
+logger = logging.getLogger(__name__)
+
+def main(host, port):
+    def close_socket(x):
+        try: x.close()
+        except: pass
+
+    while True:
+        try:
+            socket = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
+            socket.connect((host, port))
+            run_connection(socket)
+        except KeyboardInterrupt as kbi:
+            close_socket(socket)
+            raise kbi
+        except Exception as e:
+            logger.error("Connection lost: {0}; sleeping 10 seconds before retry".format(traceback.format_exc()))
+            close_socket(socket)
+            time.sleep(10)
+
+def run_connection(socket):
+    metadata = {
+        'event': 'routing/subscribe',
+        'subscriptions': ['@routing/*', '@services/*', '@ping', '@pong']
+    }
+    reg = BusinessObject(metadata, None)
+    reg.serialize(socket=socket)
+    reply, time_taken = reply_for_object(reg, socket)
+    logger.info("Subscribed: {0} in {1} secs".format(reply, time_taken))
+    own_routing_id = reply.metadata['routing-id']
+
+    last_pong = dt_now()
+    output_queue = []
+    while True:
+        now = dt_now()
+        if last_pong + datetime.timedelta(10) > now:
+            pass # send_ping
+        elif last_pong + datetime.datetime.timedelta(20) > now:
+            raise Exception("No pong received in 60 seconds")
+
+        rlist = [socket]
+        if len(output_queue) > 0:
+            wlist = [socket]
+        else:
+            wlist = []
+        rlist, wlist, xlist = select.select(rlist, wlist, [], 1)
+
+        if len(wlist) > 0:
+            for item in output_queue:
+                item.serialize(socket)
+        if len(rlist) > 0:
+            response = handle_event(read_object(socket), own_routing_id=own_routing_id)
+            if response is not None:
+                output_queue.append(response)
+
+_clients = {}
+def handle_event(request, own_routing_id=None):
+    event = request.metadata.get('event', None)
+
+    if event not in ['routing/subscribe/notification', 'routing/disconnect',
+                     'services/request']:
+        return
+
+    if event == 'routing/subscribe/notification':
+        _clients[request.metadata['routing-id']] = {'routing-id': request.metadata['routing-id'],
+                                                    'client': 'no-client',
+                                                    'user': 'no-user'}
+    elif event == 'routing/disconnect':
+        del _clients[request.metadata['routing-id']]
+    elif event == 'services/request':
+        service = request.metadata.get('service', request.metadata.get('name', None))
+        if service == 'clients':
+            request_type = request.metadata.get('request')
+            if request_type == 'list':
+                client_routing_id = request.metadata['route'][0]
+                metadata = {'event': 'services/reply',
+                            'in-reply-to': request.metadata['id'],
+                            'to': client_routing_id }
+
+                payload_contents = _clients
+                payload = json.dumps(payload_contents, ensure_ascii=False).encode('utf-8')
+                metadata['size'] = len(payload)
+                return BusinessObject(metadata, payload)
+            elif request_type == 'join':
+                client_routing_id = request.metadata['route'][0]
+                client_software = request.metadata.get('client', 'no-client')
+                user = request.metadata.get('user', 'no-user')
+
+                _clients[client_routing_id] = {'routing-id': client_routing_id,
+                                               'client': client_software,
+                                               'user': user}
+
+                metadata = {'event': 'services/reply',
+                            'in-reply-to': request.metadata['id'],
+                            'to': client_routing_id}
+                return BusinessObject(metadata, None)
+
+if __name__ == '__main__':
+   main('localhost', 7890)

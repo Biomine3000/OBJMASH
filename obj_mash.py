@@ -104,7 +104,9 @@ def read_object(socket, last_activity_timeout_secs=5, read_timeout_secs=120, log
     else:
             buffer = None
 
-    return BusinessObject(metadata, bytes(buffer))
+    if buffer is not None:
+        return BusinessObject(metadata, bytes(buffer))
+    return BusinessObject(metadata, None)
 
 def read_object_with_timeout(socket, timeout_secs=1.0):
     rlist, wlist, xlist = select.select([socket], [], [], timeout_secs)
