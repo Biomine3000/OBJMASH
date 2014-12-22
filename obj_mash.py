@@ -7,6 +7,9 @@ import select
 import datetime
 import logging
 import inspect
+import traceback
+import time
+import socket as socket_module
 
 METADATA_MAX_SIZE = 2048
 PAYLOAD_MAX_SIZE = 10485760 # 10 megabytes
@@ -139,7 +142,31 @@ def reply_for_object(obj, socket, timeout_secs=1.0):
             took = dt_now() - started
             return reply, took.total_seconds()
 
-def run_service(socket, event_handler=None, state=None, logger=None):
+# TODO: parameterize timeouts
+def service_connection_loop(host, port, event_handler=None, state=None, logger=None):
+    assert event_handler is not None
+    assert state is not None
+    assert logger is not None
+
+    def close_socket(x):
+        try: x.close()
+        except: pass
+
+    socket = None
+    while True:
+        try:
+            socket = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
+            socket.connect((host, port))
+            service_event_loop(socket, event_handler=event_handler, state=state, logger=logger)
+        except KeyboardInterrupt as kbi:
+            close_socket(socket)
+            raise kbi
+        except Exception as e:
+            logger.error("Connection lost: {0}; sleeping 10 seconds before retry".format(traceback.format_exc()))
+            close_socket(socket)
+            time.sleep(10)
+
+def service_event_loop(socket, event_handler=None, state=None, logger=None):
     assert event_handler is not None
     assert state is not None
     assert logger is not None
@@ -154,12 +181,17 @@ def run_service(socket, event_handler=None, state=None, logger=None):
     own_routing_id = reply.metadata['routing-id']
 
     last_pong = dt_now()
+    last_ping_sent = dt_now()
     output_queue = []
     while True:
         now = dt_now()
-        if last_pong + datetime.timedelta(10) > now:
-            pass # send_ping
-        elif last_pong + datetime.datetime.timedelta(20) > now:
+        if last_pong + datetime.timedelta(seconds=60) < now:
+            if last_ping_sent + datetime.timedelta(seconds=7) < now:
+                output_queue.append(BusinessObject({'event': 'ping'}, None))
+                last_ping_sent = dt_now()
+                logger.debug("Ping sent")
+
+        if last_pong + datetime.timedelta(seconds=120) < now:
             raise Exception("No pong received in 60 seconds")
 
         rlist = [socket]
@@ -174,13 +206,18 @@ def run_service(socket, event_handler=None, state=None, logger=None):
                 item.serialize(socket)
             output_queue = []
         if len(rlist) > 0:
-            new_state, response = event_handler(read_object(socket),
-                                                own_routing_id=own_routing_id,
-                                                state=state, logger=logger)
-            assert new_state is not None
-            state = new_state
-            if response is not None:
-                output_queue.append(response)
+            obj = read_object(socket)
+            if obj.event == 'pong':
+                last_pong = dt_now()
+                logger.debug("Pong received")
+            else:
+                new_state, response = event_handler(obj,
+                                                    own_routing_id=own_routing_id,
+                                                    state=state, logger=logger)
+                assert new_state is not None
+                state = new_state
+                if response is not None:
+                    output_queue.append(response)
 
 class InvalidObject(Exception): pass
 

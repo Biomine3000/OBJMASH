@@ -1,37 +1,9 @@
 # -*- coding: utf-8 -*-
 import sys; assert sys.version > '3'
-import socket as socket_module
 import logging
-import select
-import time
-import traceback
-import datetime
 import json
 
-from obj_mash import BusinessObject, run_service
-
-logger = logging.getLogger("client_registry_service")
-
-def main(host, port):
-    logging.basicConfig(level=logging.INFO)
-
-    def close_socket(x):
-        try: x.close()
-        except: pass
-
-    client_dict = {}
-    while True:
-        try:
-            socket = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
-            socket.connect((host, port))
-            run_service(socket, event_handler=handle_event, state=client_dict, logger=logger)
-        except KeyboardInterrupt as kbi:
-            close_socket(socket)
-            raise kbi
-        except Exception as e:
-            logger.error("Connection lost: {0}; sleeping 10 seconds before retry".format(traceback.format_exc()))
-            close_socket(socket)
-            time.sleep(10)
+from obj_mash import BusinessObject, service_connection_loop
 
 def handle_event(request, own_routing_id=None, state=None, logger=None):
     clients = state
@@ -86,4 +58,12 @@ def handle_event(request, own_routing_id=None, state=None, logger=None):
     return state, None
 
 if __name__ == '__main__':
-   main('localhost', 7890)
+    host = 'localhost'
+    port = 7890
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("client_registry_service")
+
+    client_dict = {}
+    service_connection_loop(host, port, event_handler=handle_event,
+                            state=client_dict, logger=logger)
