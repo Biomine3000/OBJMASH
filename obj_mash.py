@@ -162,7 +162,8 @@ def service_connection_loop(host, port, event_handler=None, state=None, logger=N
             close_socket(socket)
             raise kbi
         except Exception as e:
-            logger.error("Connection lost: {0}; sleeping 10 seconds before retry".format(traceback.format_exc()))
+            logger.error("Connection to {0}:{1} lost: {2}; sleeping 10 seconds before retry"
+                         .format(host, port, traceback.format_exc()))
             close_socket(socket)
             time.sleep(10)
 
