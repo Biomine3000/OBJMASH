@@ -139,6 +139,49 @@ def reply_for_object(obj, socket, timeout_secs=1.0):
             took = dt_now() - started
             return reply, took.total_seconds()
 
+def run_service(socket, event_handler=None, state=None, logger=None):
+    assert event_handler is not None
+    assert state is not None
+    assert logger is not None
+
+    reg = BusinessObject({
+        'event': 'routing/subscribe',
+        'subscriptions': ['@routing/*', '@services/*', '@ping', '@pong']
+        }, None)
+    reg.serialize(socket=socket)
+    reply, time_taken = reply_for_object(reg, socket)
+    logger.info("Connected and subscribed: {0} in {1} secs".format(reply.metadata, time_taken))
+    own_routing_id = reply.metadata['routing-id']
+
+    last_pong = dt_now()
+    output_queue = []
+    while True:
+        now = dt_now()
+        if last_pong + datetime.timedelta(10) > now:
+            pass # send_ping
+        elif last_pong + datetime.datetime.timedelta(20) > now:
+            raise Exception("No pong received in 60 seconds")
+
+        rlist = [socket]
+        if len(output_queue) > 0:
+            wlist = [socket]
+        else:
+            wlist = []
+        rlist, wlist, xlist = select.select(rlist, wlist, [], 1)
+
+        if len(wlist) > 0:
+            for item in output_queue:
+                item.serialize(socket)
+            output_queue = []
+        if len(rlist) > 0:
+            new_state, response = event_handler(read_object(socket),
+                                                own_routing_id=own_routing_id,
+                                                state=state, logger=logger)
+            assert new_state is not None
+            state = new_state
+            if response is not None:
+                output_queue.append(response)
+
 class InvalidObject(Exception): pass
 
 class BusinessObject(object):

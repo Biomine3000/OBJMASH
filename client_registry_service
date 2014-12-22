@@ -8,7 +8,7 @@ import traceback
 import datetime
 import json
 
-from obj_mash import BusinessObject, InvalidObject, read_object, dt_now, reply_for_object
+from obj_mash import BusinessObject, run_service
 
 logger = logging.getLogger("client_registry_service")
 
@@ -19,11 +19,12 @@ def main(host, port):
         try: x.close()
         except: pass
 
+    client_dict = {}
     while True:
         try:
             socket = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
             socket.connect((host, port))
-            run_connection(socket)
+            run_service(socket, event_handler=handle_event, state=client_dict, logger=logger)
         except KeyboardInterrupt as kbi:
             close_socket(socket)
             raise kbi
@@ -32,90 +33,57 @@ def main(host, port):
             close_socket(socket)
             time.sleep(10)
 
-def run_connection(socket):
-    metadata = {
-        'event': 'routing/subscribe',
-        'subscriptions': ['@routing/*', '@services/*', '@ping', '@pong']
-    }
-    reg = BusinessObject(metadata, None)
-    reg.serialize(socket=socket)
-    reply, time_taken = reply_for_object(reg, socket)
-    logger.info("Connected and subscribed: {0} in {1} secs".format(reply.metadata, time_taken))
-    own_routing_id = reply.metadata['routing-id']
-
-    last_pong = dt_now()
-    output_queue = []
-    while True:
-        now = dt_now()
-        if last_pong + datetime.timedelta(10) > now:
-            pass # send_ping
-        elif last_pong + datetime.datetime.timedelta(20) > now:
-            raise Exception("No pong received in 60 seconds")
-
-        rlist = [socket]
-        if len(output_queue) > 0:
-            wlist = [socket]
-        else:
-            wlist = []
-        rlist, wlist, xlist = select.select(rlist, wlist, [], 1)
-
-        if len(wlist) > 0:
-            for item in output_queue:
-                item.serialize(socket)
-            output_queue = []
-        if len(rlist) > 0:
-            response = handle_event(read_object(socket), own_routing_id=own_routing_id)
-            if response is not None:
-                output_queue.append(response)
-
-_clients = {}
-def handle_event(request, own_routing_id=None):
+def handle_event(request, own_routing_id=None, state=None, logger=None):
+    clients = state
     event = request.metadata.get('event', None)
 
     if event not in ['routing/subscribe/notification', 'routing/disconnect',
                      'services/request']:
-        return
+        return state, None
 
     if event == 'routing/subscribe/notification':
         client = {'routing-id': request.metadata['routing-id'],
                   'client': 'no-client',
                   'user': 'no-user'}
         logger.info("New client: {0}".format(client))
-        _clients[request.metadata['routing-id']] = client
+        clients[request.metadata['routing-id']] = client
+        return state, None
     elif event == 'routing/disconnect':
-        if request.metadata['routing-id'] in _clients:
-            del _clients[request.metadata['routing-id']]
+        if request.metadata['routing-id'] in clients:
+            del clients[request.metadata['routing-id']]
         logger.info("Client {0} disconnected".format(request.metadata['routing-id']))
+        return state, None
     elif event == 'services/request':
         service = request.metadata.get('service', request.metadata.get('name', None))
         if service == 'clients':
             request_type = request.metadata.get('request')
             if request_type == 'list':
                 client_routing_id = request.metadata['route'][0]
-                logger.info("List request from {0}".format(_clients[client_routing_id]))
+                logger.info("List request from {0}".format(clients[client_routing_id]))
                 metadata = {'event': 'services/reply',
                             'in-reply-to': request.metadata['id'],
                             'to': client_routing_id }
 
-                payload_contents = _clients
+                payload_contents = clients
                 payload = json.dumps(payload_contents, ensure_ascii=False).encode('utf-8')
                 metadata['size'] = len(payload)
-                return BusinessObject(metadata, payload)
+                return state, BusinessObject(metadata, payload)
             elif request_type == 'join':
                 client_routing_id = request.metadata['route'][0]
                 client_software = request.metadata.get('client', 'no-client')
                 user = request.metadata.get('user', 'no-user')
 
-                _clients[client_routing_id] = {'routing-id': client_routing_id,
-                                               'client': client_software,
-                                               'user': user}
+                clients[client_routing_id] = {'routing-id': client_routing_id,
+                                              'client': client_software,
+                                              'user': user}
 
-                logger.info("Join request from {0}".format(_clients[client_routing_id]))
+                logger.info("Join request from {0}".format(clients[client_routing_id]))
 
                 metadata = {'event': 'services/reply',
                             'in-reply-to': request.metadata['id'],
                             'to': client_routing_id}
-                return BusinessObject(metadata, None)
+                return state, BusinessObject(metadata, None)
+    return state, None
 
 if __name__ == '__main__':
    main('localhost', 7890)
