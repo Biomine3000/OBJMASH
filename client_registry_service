@@ -10,9 +10,11 @@ import json
 
 from obj_mash import BusinessObject, InvalidObject, read_object, dt_now, reply_for_object
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("client_registry_service")
 
 def main(host, port):
+    logging.basicConfig(level=logging.INFO)
+
     def close_socket(x):
         try: x.close()
         except: pass
@@ -38,7 +40,7 @@ def run_connection(socket):
     reg = BusinessObject(metadata, None)
     reg.serialize(socket=socket)
     reply, time_taken = reply_for_object(reg, socket)
-    logger.info("Subscribed: {0} in {1} secs".format(reply, time_taken))
+    logger.info("Connected and subscribed: {0} in {1} secs".format(reply.metadata, time_taken))
     own_routing_id = reply.metadata['routing-id']
 
     last_pong = dt_now()
@@ -60,6 +62,7 @@ def run_connection(socket):
         if len(wlist) > 0:
             for item in output_queue:
                 item.serialize(socket)
+            output_queue = []
         if len(rlist) > 0:
             response = handle_event(read_object(socket), own_routing_id=own_routing_id)
             if response is not None:
@@ -74,17 +77,22 @@ def handle_event(request, own_routing_id=None):
         return
 
     if event == 'routing/subscribe/notification':
-        _clients[request.metadata['routing-id']] = {'routing-id': request.metadata['routing-id'],
-                                                    'client': 'no-client',
-                                                    'user': 'no-user'}
+        client = {'routing-id': request.metadata['routing-id'],
+                  'client': 'no-client',
+                  'user': 'no-user'}
+        logger.info("New client: {0}".format(client))
+        _clients[request.metadata['routing-id']] = client
     elif event == 'routing/disconnect':
-        del _clients[request.metadata['routing-id']]
+        if request.metadata['routing-id'] in _clients:
+            del _clients[request.metadata['routing-id']]
+        logger.info("Client {0} disconnected".format(request.metadata['routing-id']))
     elif event == 'services/request':
         service = request.metadata.get('service', request.metadata.get('name', None))
         if service == 'clients':
             request_type = request.metadata.get('request')
             if request_type == 'list':
                 client_routing_id = request.metadata['route'][0]
+                logger.info("List request from {0}".format(_clients[client_routing_id]))
                 metadata = {'event': 'services/reply',
                             'in-reply-to': request.metadata['id'],
                             'to': client_routing_id }
@@ -101,6 +109,8 @@ def handle_event(request, own_routing_id=None):
                 _clients[client_routing_id] = {'routing-id': client_routing_id,
                                                'client': client_software,
                                                'user': user}
+
+                logger.info("Join request from {0}".format(_clients[client_routing_id]))
 
                 metadata = {'event': 'services/reply',
                             'in-reply-to': request.metadata['id'],
